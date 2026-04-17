@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Qontinui Inspector</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <header>
+      <h1>Qontinui Inspector</h1>
+      <div id="status-bar" class="status-bar">
+        <span id="backend-name">backend: ...</span>
+        <span id="status-message">idle</span>
+      </div>
+    </header>
+
+    <section class="mode-selector">
+      <label><input type="radio" name="mode" value="hover" checked /> Hover Mode (Ctrl)</label>
+      <label><input type="radio" name="mode" value="focus" /> Focus Tracking</label>
+      <label><input type="radio" name="mode" value="selector" /> Show Selector</label>
+      <button id="capture-btn">Capture Desktop</button>
+    </section>
+
+    <section id="mode-pane">
+      <div id="hover-pane" class="pane active">
+        <p class="hint">Hold <kbd>Ctrl</kbd> and hover over a UI element to inspect it.</p>
+        <div id="highlight-preview" class="highlight-preview highlight-hover">
+          hover highlight (yellow)
+        </div>
+      </div>
+      <div id="focus-pane" class="pane">
+        <p class="hint">
+          Focus tracking: <strong>coming soon</strong>. See Phase 4 of the
+          native-accessibility-expansion plan.
+        </p>
+      </div>
+      <div id="selector-pane" class="pane">
+        <p class="hint">Enter a ref id to see its selector:</p>
+        <input id="ref-input" type="text" placeholder="@e1" />
+        <button id="get-selector-btn">Get Selector</button>
+        <pre id="selector-output"></pre>
+      </div>
+    </section>
+
+    <section id="property-grid">
+      <h2>Property Grid <button id="toggle-all-btn" title="Collapse/expand all">[+/-]</button></h2>
+      <div id="current-ref" class="current-ref">(no element hovered)</div>
+
+      <details data-section="identifier" open>
+        <summary>Identifier</summary>
+        <table>
+          <tr><th>ref</th><td id="prop-ref"></td></tr>
+          <tr><th>role</th><td id="prop-role"></td></tr>
+          <tr><th>name</th><td id="prop-name"></td></tr>
+          <tr><th>value</th><td id="prop-value"></td></tr>
+          <tr><th>automation_id</th><td id="prop-automation-id"></td></tr>
+          <tr><th>class_name</th><td id="prop-class-name"></td></tr>
+          <tr><th>html_tag</th><td id="prop-html-tag"></td></tr>
+        </table>
+      </details>
+
+      <details data-section="state" open>
+        <summary>State</summary>
+        <pre id="prop-state"></pre>
+      </details>
+
+      <details data-section="bounds" open>
+        <summary>Bounds</summary>
+        <pre id="prop-bounds"></pre>
+      </details>
+
+      <details data-section="selector" open>
+        <summary>Selector</summary>
+        <pre id="prop-selector"></pre>
+      </details>
+    </section>
+
+    <script type="module" src="main.js"></script>
+  </body>
+</html>

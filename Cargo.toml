@@ -1,0 +1,60 @@
+[package]
+name = "qontinui-inspect"
+version = "0.1.0"
+description = "Native accessibility inspector for Qontinui (Phase 4 scaffold)"
+authors = ["Qontinui <contact@qontinui.org>"]
+edition = "2021"
+
+# Standalone workspace: Cargo 1.94 rejects workspace members whose Cargo.toml
+# is not hierarchically below the workspace root, so qontinui-inspect cannot
+# be a member of `qontinui-runner/Cargo.toml`'s workspace (it's a sibling dir,
+# not below). We declare our own workspace here; the path dependency on
+# qontinui-runner/src-tauri still works across workspaces.
+[workspace]
+members = ["."]
+resolver = "2"
+
+# Scaffold notes:
+# - Rust-side compiles cleanly via `cargo check -p qontinui-inspect`.
+# - Frontend is vanilla HTML+JS under `src-frontend/` to avoid a JS toolchain
+#   rabbithole for the scaffold. `cargo build` requires the frontend dir to
+#   exist (it does, see tauri.conf.json `frontendDist`), but no npm step.
+# - The inspector's own Rust-visible UI renders highlight colors (yellow/blue/
+#   green); the in-target-app overlay window is future work (see lib.rs docs).
+
+[build-dependencies]
+tauri-build = { version = "2.5", features = [] }
+
+[dependencies]
+tauri = { version = "2.5", features = [] }
+tauri-plugin-store = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+anyhow = "1"
+
+# Depend on the runner's accessibility module via its library crate.
+# Package name in qontinui-runner/src-tauri/Cargo.toml is "qontinui-runner",
+# its library target is named "qontinui_runner_lib" (crate-type rlib+cdylib).
+qontinui-runner = { path = "../qontinui-runner/src-tauri" }
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_Graphics_Gdi",
+] }
+
+[lints.rust]
+dead_code = "allow"
+unused_variables = "allow"
+unused_imports = "allow"
+unused_assignments = "allow"
+unused_mut = "allow"
+
+[profile.dev]
+debug = 0
+split-debuginfo = "packed"
