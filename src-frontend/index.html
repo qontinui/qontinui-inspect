@@ -16,15 +16,25 @@
     </header>
 
     <section class="mode-selector">
-      <label><input type="radio" name="mode" value="hover" checked /> Hover Mode (Ctrl)</label>
-      <label><input type="radio" name="mode" value="focus" /> Focus Tracking</label>
-      <label><input type="radio" name="mode" value="selector" /> Show Selector</label>
+      <label
+        ><input type="radio" name="mode" value="hover" checked /> Hover Mode
+        (Ctrl)</label
+      >
+      <label
+        ><input type="radio" name="mode" value="focus" /> Focus Tracking</label
+      >
+      <label
+        ><input type="radio" name="mode" value="selector" /> Show
+        Selector</label
+      >
       <button id="capture-btn">Capture Desktop</button>
     </section>
 
     <section id="mode-pane">
       <div id="hover-pane" class="pane active">
-        <p class="hint">Hold <kbd>Ctrl</kbd> and hover over a UI element to inspect it.</p>
+        <p class="hint">
+          Hold <kbd>Ctrl</kbd> and hover over a UI element to inspect it.
+        </p>
         <div id="highlight-preview" class="highlight-preview highlight-hover">
           hover highlight (yellow)
         </div>
@@ -44,19 +54,43 @@
     </section>
 
     <section id="property-grid">
-      <h2>Property Grid <button id="toggle-all-btn" title="Collapse/expand all">[+/-]</button></h2>
+      <h2>
+        Property Grid
+        <button id="toggle-all-btn" title="Collapse/expand all">[+/-]</button>
+      </h2>
       <div id="current-ref" class="current-ref">(no element hovered)</div>
 
       <details data-section="identifier" open>
         <summary>Identifier</summary>
         <table>
-          <tr><th>ref</th><td id="prop-ref"></td></tr>
-          <tr><th>role</th><td id="prop-role"></td></tr>
-          <tr><th>name</th><td id="prop-name"></td></tr>
-          <tr><th>value</th><td id="prop-value"></td></tr>
-          <tr><th>automation_id</th><td id="prop-automation-id"></td></tr>
-          <tr><th>class_name</th><td id="prop-class-name"></td></tr>
-          <tr><th>html_tag</th><td id="prop-html-tag"></td></tr>
+          <tr>
+            <th>ref</th>
+            <td id="prop-ref"></td>
+          </tr>
+          <tr>
+            <th>role</th>
+            <td id="prop-role"></td>
+          </tr>
+          <tr>
+            <th>name</th>
+            <td id="prop-name"></td>
+          </tr>
+          <tr>
+            <th>value</th>
+            <td id="prop-value"></td>
+          </tr>
+          <tr>
+            <th>automation_id</th>
+            <td id="prop-automation-id"></td>
+          </tr>
+          <tr>
+            <th>class_name</th>
+            <td id="prop-class-name"></td>
+          </tr>
+          <tr>
+            <th>html_tag</th>
+            <td id="prop-html-tag"></td>
+          </tr>
         </table>
       </details>
 

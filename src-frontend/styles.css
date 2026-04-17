@@ -1,4 +1,6 @@
-* { box-sizing: border-box; }
+* {
+  box-sizing: border-box;
+}
 body {
   margin: 0;
   font-family: -apple-system, "Segoe UI", sans-serif;
@@ -10,7 +12,10 @@ header {
   padding: 8px 16px;
   border-bottom: 1px solid #374151;
 }
-h1 { font-size: 16px; margin: 0; }
+h1 {
+  font-size: 16px;
+  margin: 0;
+}
 .status-bar {
   display: flex;
   justify-content: space-between;
@@ -26,8 +31,12 @@ h1 { font-size: 16px; margin: 0; }
   gap: 12px;
   align-items: center;
 }
-.mode-selector label { cursor: pointer; }
-#capture-btn, #get-selector-btn, #toggle-all-btn {
+.mode-selector label {
+  cursor: pointer;
+}
+#capture-btn,
+#get-selector-btn,
+#toggle-all-btn {
   margin-left: auto;
   background: #3b82f6;
   color: white;
@@ -37,12 +46,29 @@ h1 { font-size: 16px; margin: 0; }
   cursor: pointer;
   font-family: inherit;
 }
-#capture-btn:hover, #get-selector-btn:hover { background: #2563eb; }
-#toggle-all-btn { background: #4b5563; font-size: 11px; padding: 2px 6px; }
-#mode-pane { padding: 12px 16px; border-bottom: 1px solid #374151; }
-.pane { display: none; }
-.pane.active { display: block; }
-.hint { color: #9ca3af; font-size: 12px; }
+#capture-btn:hover,
+#get-selector-btn:hover {
+  background: #2563eb;
+}
+#toggle-all-btn {
+  background: #4b5563;
+  font-size: 11px;
+  padding: 2px 6px;
+}
+#mode-pane {
+  padding: 12px 16px;
+  border-bottom: 1px solid #374151;
+}
+.pane {
+  display: none;
+}
+.pane.active {
+  display: block;
+}
+.hint {
+  color: #9ca3af;
+  font-size: 12px;
+}
 kbd {
   background: #374151;
   border: 1px solid #4b5563;
@@ -58,10 +84,21 @@ kbd {
   font-family: monospace;
   font-size: 11px;
 }
-.highlight-hover { background: #eab308; color: #111827; }   /* yellow */
-.highlight-selected { background: #3b82f6; color: white; }  /* blue */
-.highlight-target { background: #10b981; color: white; }    /* green */
-#property-grid { padding: 12px 16px; }
+.highlight-hover {
+  background: #eab308;
+  color: #111827;
+} /* yellow */
+.highlight-selected {
+  background: #3b82f6;
+  color: white;
+} /* blue */
+.highlight-target {
+  background: #10b981;
+  color: white;
+} /* green */
+#property-grid {
+  padding: 12px 16px;
+}
 #property-grid h2 {
   font-size: 13px;
   margin: 0 0 8px 0;
@@ -79,7 +116,9 @@ details {
   border: 1px solid #374151;
   border-radius: 4px;
 }
-details[open] { background: #111827; }
+details[open] {
+  background: #111827;
+}
 summary {
   padding: 6px 10px;
   cursor: pointer;
@@ -120,4 +159,7 @@ input[type="text"] {
   font-family: monospace;
   width: 200px;
 }
-#selector-output { color: #10b981; margin-top: 8px; }
+#selector-output {
+  color: #10b981;
+  margin-top: 8px;
+}

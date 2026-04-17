@@ -12,19 +12,19 @@
 //! - [x] Tauri window launches (800x600, title "Qontinui Inspector").
 //! - [x] Three-mode selector UI (Hover / Focus / Selector).
 //! - [x] Hover Mode — implemented end-to-end on Windows using cursor-position
-//!       polling (not a global mouse hook). Polls `GetAsyncKeyState(VK_CONTROL)`
-//!       every ~100ms; when Ctrl is held, emits `element-hovered` events.
+//!   polling (not a global mouse hook). Polls `GetAsyncKeyState(VK_CONTROL)`
+//!   every ~100ms; when Ctrl is held, emits `element-hovered` events.
 //! - [x] Property grid — reads `role`, `automation_id`, `class_name`, `state`,
-//!       `bounds` from the cached `UnifiedNode`.
+//!   `bounds` from the cached `UnifiedNode`.
 //! - [x] `tauri-plugin-store` persists `collapsed_sections`.
 //! - [ ] Focus Tracking — stub only (see `start_focus_tracking`).
 //! - [ ] Show Selector — placeholder `@<ref_id>` (see `get_selector_for_ref`).
 //! - [ ] In-target-app overlay drawing (the Phase 4 novel piece — transparent
-//!       overlay window + GDI paint loop) is deferred. For now, highlight
-//!       colors render only in the inspector's own UI:
-//!           hover    = yellow  (#eab308)
-//!           selected = blue    (#3b82f6)
-//!           focused  = green   (#10b981)  -- reserved, not yet emitted
+//!   overlay window + GDI paint loop) is deferred. For now, highlight
+//!   colors render only in the inspector's own UI:
+//!   - hover    = yellow  (#eab308)
+//!   - selected = blue    (#3b82f6)
+//!   - focused  = green   (#10b981)  -- reserved, not yet emitted
 //!
 //! # Architecture note
 //!
@@ -128,7 +128,7 @@ fn node_contains(node: &UnifiedNode, x: i32, y: i32) -> bool {
     }
 }
 
-fn find_deepest_at<'a>(node: &'a UnifiedNode, x: i32, y: i32) -> Option<&'a UnifiedNode> {
+fn find_deepest_at(node: &UnifiedNode, x: i32, y: i32) -> Option<&UnifiedNode> {
     if !node_contains(node, x, y) {
         return None;
     }
@@ -146,17 +146,13 @@ fn find_deepest_at<'a>(node: &'a UnifiedNode, x: i32, y: i32) -> Option<&'a Unif
 // -----------------------------------------------------------------------------
 
 #[tauri::command]
-async fn get_backend_name(
-    state: tauri::State<'_, InspectorState>,
-) -> Result<String, String> {
+async fn get_backend_name(state: tauri::State<'_, InspectorState>) -> Result<String, String> {
     let mgr = state.manager.lock().await;
     Ok(mgr.backend_name().to_string())
 }
 
 #[tauri::command]
-async fn capture_desktop(
-    state: tauri::State<'_, InspectorState>,
-) -> Result<u32, String> {
+async fn capture_desktop(state: tauri::State<'_, InspectorState>) -> Result<u32, String> {
     let mut mgr = state.manager.lock().await;
     if !mgr.is_connected() {
         mgr.connect(ConnectionTarget::Desktop, 5000)
@@ -277,10 +273,7 @@ async fn get_property_grid(
 /// Persist the list of property-grid section IDs currently collapsed, via
 /// `tauri-plugin-store`. Stored in `inspect-settings.dat`.
 #[tauri::command]
-async fn save_collapse_state(
-    sections: Vec<String>,
-    app: tauri::AppHandle,
-) -> Result<(), String> {
+async fn save_collapse_state(sections: Vec<String>, app: tauri::AppHandle) -> Result<(), String> {
     use tauri_plugin_store::StoreExt;
     let store = app
         .store("inspect-settings.dat")
@@ -360,9 +353,7 @@ async fn windows_hover_loop(
         let grid_opt = if let Some(state) = app.try_state::<InspectorState>() {
             let mgr = state.manager.lock().await;
             let snap = mgr.snapshot().await;
-            snap.and_then(|s| {
-                find_deepest_at(&s.root, pt.x, pt.y).map(PropertyGrid::from_node)
-            })
+            snap.and_then(|s| find_deepest_at(&s.root, pt.x, pt.y).map(PropertyGrid::from_node))
         } else {
             None
         };

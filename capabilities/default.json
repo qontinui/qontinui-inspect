@@ -3,8 +3,5 @@
   "identifier": "default",
   "description": "Default capability for the inspector window",
   "windows": ["main"],
-  "permissions": [
-    "core:default",
-    "store:default"
-  ]
+  "permissions": ["core:default", "store:default"]
 }

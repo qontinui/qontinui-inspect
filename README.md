@@ -36,8 +36,8 @@ cargo tauri dev            # full app (needs frontend build toolchain)
 
 - **Hover Mode** — Ctrl+hover highlights the element under the cursor; property
   grid updates live.
-- **Focus Tracking** — *stub*. Will subscribe to `UIA_AutomationFocusChangedEventId`.
-- **Show Selector** — *stub*. Returns `@<ref_id>` placeholder; will render full
+- **Focus Tracking** — _stub_. Will subscribe to `UIA_AutomationFocusChangedEventId`.
+- **Show Selector** — _stub_. Returns `@<ref_id>` placeholder; will render full
   qontinui-selector strings once the grammar stabilizes.
 
 ## Platform
