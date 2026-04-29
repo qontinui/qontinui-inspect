@@ -44,3 +44,7 @@ cargo tauri dev            # full app (needs frontend build toolchain)
 
 - Windows: functional via runner's UIA and JAB adapters.
 - Linux (AT-SPI) and macOS (AX): hover loop not yet wired; returns early.
+
+## License
+
+Licensed under the GNU Affero General Public License v3.0 or later (AGPL-3.0-or-later). See [LICENSE](LICENSE) for full terms. Contributing requires signing the [CLA](CLA.md) — see [CONTRIBUTING.md](CONTRIBUTING.md).
