@@ -1,16 +1,144 @@
 name: qontinui CI
+
+# The workflow name is the check context coord's merge engine reads. Keep it
+# stable ("qontinui CI") — renaming it orphans the recorded CI baseline.
+
 on: [push, pull_request]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
 jobs:
   build:
-    runs-on: ubuntu-latest
+    # ubuntu-22.04, not ubuntu-latest: this mirrors the leg of
+    # qontinui-runner's own CI that is known to build this dependency tree.
+    runs-on: ubuntu-22.04
+
+    # The path dependency below drags in the whole qontinui-runner crate, so a
+    # COLD cache compiles thousands of crates — locally that peaks at ~11 GB
+    # resident in a single rustc. Bounded well under the 6h job ceiling so a
+    # genuine hang fails fast instead of burning a runner for six hours; warm
+    # runs finish in a fraction of this.
+    timeout-minutes: 150
+
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@v5
+
+      # This crate path-depends on a SIBLING REPOSITORY:
+      #
+      #   qontinui-inspect/Cargo.toml
+      #     qontinui-runner = { path = "../qontinui-runner/src-tauri" }
+      #   qontinui-runner/src-tauri/Cargo.toml
+      #     qontinui-types       = { path = "../../qontinui-schemas/rust" }
+      #     qontinui-code-graph  = { path = "../../qontinui-schemas/code-graph" }
+      #     qontinui-vision-core = { path = "../../qontinui-schemas/rust-vision-core" }
+      #
+      # Without these clones cargo cannot even resolve the manifest, so every
+      # cargo invocation — `cargo fmt` included — dies before it starts:
+      #
+      #   failed to load manifest for dependency `qontinui-runner`
+      #   failed to read .../qontinui-runner/src-tauri/Cargo.toml
+      #   No such file or directory (os error 2)
+      #
+      # That is what kept main red. Both repos are public and org-owned, so the
+      # default github.token authenticates the clone; no PAT needed.
+      - name: Checkout sibling repos
+        run: |
+          cd "$GITHUB_WORKSPACE/.."
+          git clone --depth 1 https://github.com/qontinui/qontinui-runner.git
+          git clone --depth 1 https://github.com/qontinui/qontinui-schemas.git
+        shell: bash
+
+      # Pinned to match qontinui-runner/rust-toolchain.toml. That file governs
+      # cargo invoked from the runner's tree but NOT from this one, so without
+      # an explicit pin here the two repos can silently build the same crates on
+      # different compilers.
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: "1.95.0"
           components: rustfmt, clippy
+
+      # Tauri's Linux build links against webkit2gtk and friends; atspi/zbus in
+      # the runner's accessibility module pull in the at-spi headers.
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            build-essential \
+            curl \
+            wget \
+            file \
+            libssl-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libdbus-1-dev \
+            libatspi2.0-dev \
+            at-spi2-core
+
+      # Hosted ubuntu runners ship ~14 GB free on /, and this dependency tree
+      # plus the swapfile below plus the cargo cache exhausts it. Reclaim the
+      # preinstalled toolchains we never use BEFORE the swapfile, so both have
+      # headroom. `large-packages: false` is deliberate: it cascade-removes the
+      # GTK/GDK apt libs the webkit build links against.
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: false
+          docker-images: true
+          swap-storage: false
+
+      # Peak rustc/LLVM codegen memory on this tree exceeds the runner's 16 GB,
+      # and the OOM-killer takes the agent down with it ("shutdown signal ...
+      # exit code 143"). Pre-allocate paging space to absorb the spike.
+      - name: Add swapfile
+        run: |
+          sudo swapoff -a || true
+          sudo fallocate -l 12G /swapfile
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
+          free -h
+          df -h
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          # Keyed across both trees so a runner-side dep bump invalidates it.
+          key: qontinui-inspect-ubuntu-22.04
+
+      # `-p qontinui-inspect`, NOT `--all`. cargo-fmt formats every package with
+      # a local path — which, through the path dependency above, means the whole
+      # of qontinui-runner and qontinui-schemas. Verified locally: `cargo fmt
+      # --all -- --check` here emits ~2800 lines of diff against sibling-repo
+      # sources this repo does not own, while the `-p` form is clean. Those
+      # repos gate their own formatting in their own CI.
       - name: Format
-        run: cargo fmt --all -- --check
+        run: cargo fmt -p qontinui-inspect -- --check
+
+      # Same scoping rationale. clippy only applies its lint driver to workspace
+      # members (here just `.`), but naming the package makes that explicit
+      # rather than incidental.
       - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
-      - name: Test
-        run: cargo test --all
+        run: cargo clippy -p qontinui-inspect --all-targets -- -D warnings
+        env:
+          CARGO_BUILD_JOBS: 2
+
+      # `cargo check`, not `cargo test --all`: this crate has no tests of its
+      # own, and `--all` would drag in the runner workspace's suite, which that
+      # repo's CI already covers and which needs a Postgres service plus several
+      # more sibling checkouts to run. Add a `test` step the day this crate
+      # grows tests of its own.
+      - name: Check
+        run: cargo check -p qontinui-inspect --all-targets
+        env:
+          CARGO_BUILD_JOBS: 2
