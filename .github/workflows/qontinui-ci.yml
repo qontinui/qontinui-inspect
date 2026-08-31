@@ -3,7 +3,42 @@ name: qontinui CI
 # The workflow name is the check context coord's merge engine reads. Keep it
 # stable ("qontinui CI") — renaming it orphans the recorded CI baseline.
 
-on: [push, pull_request]
+# DO NOT DELETE THE `push:` TRIGGER, and do not narrow it past the branch list
+# below. coord's merge train pushes `merge-candidate/<uuid>` and waits
+# `awaiting-ci` for check-runs on that ref. A `pull_request`-only workflow can
+# never satisfy it: the train times out at COORD_MERGE_CI_TIMEOUT (1800s),
+# requeues forever, and permanently consumes one of COORD_MERGE_SLOTS
+# (default 3). coord also judges "can this repo produce candidate CI?" purely on
+# the PRESENCE of this `push:` key (`ci_baseline.rs`
+# `is_candidate_check_producing_trigger` is branch-filter-blind by design), so
+# deleting it trips AlertKind::MergeCandidateNoCiProducer.
+#
+# The three `merge-candidate*` prefixes are coord's authoritative list
+# (`ci_observer.rs` CANDIDATE_BRANCH_PREFIXES_EXACT). Omitting one wedges the
+# train. `main` must stay too: coord's head-baseline axis needs a `push`
+# trigger that CAN fire on the default branch.
+#
+# WHY THIS IS SCOPED RATHER THAN THE `on: [push, pull_request]` IT REPLACED.
+# An UNFILTERED `push:` also fired on every PR head branch, so every PR ran this
+# workflow TWICE against the same head SHA - two runs of identical work
+# competing for the same hosted-runner pool, and the PR pinned at
+# mergeStateStatus=UNSTABLE until the slower duplicate drained. A `concurrency:`
+# block does NOT fix it: `github.ref` differs by event (`refs/heads/<branch>` vs
+# `refs/pull/<n>/merge`) so the two runs land in different groups - measured,
+# qontinui-docs and qontinui-gym carry `cancel-in-progress: true` and still emit
+# both runs at one SHA. Plan:
+# 2026-08-31-devops-unfiltered-push-trigger-duplicates-every-pr-ci-run.
+#
+# `pull_request:` is deliberately left UNFILTERED so stacked PRs based on a
+# long-lived integration branch still get CI.
+on:
+  push:
+    branches:
+      - main
+      - 'merge-candidate/**'
+      - 'merge-candidate-spec/**'
+      - 'merge-candidate-batch/**'
+  pull_request:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
