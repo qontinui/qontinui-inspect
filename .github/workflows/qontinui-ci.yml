@@ -40,9 +40,43 @@ on:
       - 'merge-candidate-batch/**'
   pull_request:
 
+# CANCEL ONLY THE PR LANE. `cancel-in-progress` must NOT be a bare `true` here,
+# because the scoped `push:` above leaves exactly two kinds of push run — `main`
+# and `merge-candidate*` — and cancelling either is a coord merge-train hazard:
+#
+#   - `merge-candidate*`: coord's own convention for these refs is
+#     `cancel-in-progress: false`, stated verbatim in the candidate-CI workflow
+#     it holds as the shape every train repo should carry (`ci_baseline.rs`
+#     COORD_CANDIDATE_CI_WORKFLOW_YAML): "a candidate re-push mid-run is rare
+#     and a duplicate run is cheaper than a half-reported check set". A
+#     cancelled candidate run puts a NON-SUCCESS row in `coord.pr_check_runs`
+#     for the very ref the train polls in `awaiting-ci`.
+#   - `main`: the group below resolves to `qontinui CI-refs/heads/main`, which is
+#     exactly the group a prospective land's `(push, refs/heads/main)` event
+#     resolves into — so every in-flight main run here is `reaper_at_risk` by
+#     `ci_observer.rs` `run_is_reaper_at_risk`. coord already models the reap
+#     that happens even at `false` (GitHub reaps the oldest PENDING run in a
+#     group); `true` upgrades that from "queued behind" to an actual
+#     cancellation, leaving a `cancelled` conclusion on a main SHA whose
+#     baseline coord then reads as non-success. `qontinui CI` is not on
+#     `BENIGN_SUPERSESSION_WORKFLOWS`, so nothing downgrades that.
+#
+# `pull_request` runs are the one lane where cancelling is both safe and worth
+# real money: coord explicitly excludes PR-lane runs from the no-reap blocking
+# set (`ci_observer.rs` `is_excluded_from_blocking` — "a main push neither
+# cancels nor invalidates a PR run"), the cancelled attempt lands on the
+# SUPERSEDED head SHA rather than the current one, and this job is a cold-cache
+# Rust build of the whole runner tree (`timeout-minutes: 150`). Superseding one
+# of those is the saving the trigger scoping above was after in the first place.
+#
+# Note for anyone reading coord's cached view of this file: `parse_concurrency`
+# matches only the literals `true`/`True`/`yes`, so it records this expression as
+# `cancel_in_progress: false`. That field is observability only — no gate reads
+# it, and `run_is_reaper_at_risk` keys on the GROUP alone — so the conservative
+# reading costs nothing.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
