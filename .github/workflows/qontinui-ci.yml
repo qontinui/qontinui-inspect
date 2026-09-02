@@ -24,9 +24,12 @@ name: qontinui CI
 # competing for the same hosted-runner pool, and the PR pinned at
 # mergeStateStatus=UNSTABLE until the slower duplicate drained. A `concurrency:`
 # block does NOT fix it: `github.ref` differs by event (`refs/heads/<branch>` vs
-# `refs/pull/<n>/merge`) so the two runs land in different groups - measured,
-# qontinui-docs and qontinui-gym carry `cancel-in-progress: true` and still emit
-# both runs at one SHA. Plan:
+# `refs/pull/<n>/merge`) so the two runs land in different groups - measured on
+# qontinui-docs and qontinui-gym, which BOTH carried `cancel-in-progress: true`
+# when that measurement was taken and still emitted both runs at one SHA. Stated
+# in the past tense deliberately: it is a record of the evidence, not a claim
+# about what those files carry today (docs took this file's guard in docs#8).
+# Plan:
 # 2026-08-31-devops-unfiltered-push-trigger-duplicates-every-pr-ci-run.
 #
 # `pull_request:` is deliberately left UNFILTERED so stacked PRs based on a
@@ -74,6 +77,18 @@ on:
 # `cancel_in_progress: false`. That field is observability only — no gate reads
 # it, and `run_is_reaper_at_risk` keys on the GROUP alone — so the conservative
 # reading costs nothing.
+#
+# THE GROUP CARRIES AN UNSTATED PRECONDITION. `cancel-in-progress` above keys on
+# the EVENT, but the group below keys only on the REF, and that is sufficient
+# today only because no two triggers here can put different event kinds on one
+# ref: `push` runs are `refs/heads/<branch>` and `pull_request` runs are
+# `refs/pull/<n>/merge`, so the PR lane can never share a group with the two
+# lanes this block protects. Adding a `workflow_dispatch:` trigger breaks that -
+# a manual dispatch on `main` resolves to `refs/heads/main` and lands in
+# `qontinui CI-refs/heads/main` alongside the push runs coord's head baseline
+# reads. If you add one, key the GROUP by `github.event_name` too, the way
+# `qontinui-coord/.github/workflows/ci.yml` already does
+# (`ci-${{ github.event_name }}-${{ github.ref }}`).
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
