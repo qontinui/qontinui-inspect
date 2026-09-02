@@ -28,7 +28,12 @@ name: qontinui CI
 # qontinui-docs and qontinui-gym, which BOTH carried `cancel-in-progress: true`
 # when that measurement was taken and still emitted both runs at one SHA. Stated
 # in the past tense deliberately: it is a record of the evidence, not a claim
-# about what those files carry today (docs took this file's guard in docs#8).
+# about what those files carry now. The parenthetical that used to name
+# qontinui-docs#8 here is gone for exactly that reason: it read as "docs has
+# taken the guard and gym has not", and qontinui-gym#6 took the guard 18 seconds
+# after the correction carrying that parenthetical merged. A live-state claim
+# about a sibling repo rots faster than anyone re-reads this file; the
+# measurement does not.
 # Plan:
 # 2026-08-31-devops-unfiltered-push-trigger-duplicates-every-pr-ci-run.
 #
@@ -54,15 +59,15 @@ on:
 #     and a duplicate run is cheaper than a half-reported check set". A
 #     cancelled candidate run puts a NON-SUCCESS row in `coord.pr_check_runs`
 #     for the very ref the train polls in `awaiting-ci`.
-#   - `main`: the group below resolves to `qontinui CI-refs/heads/main`, which is
-#     exactly the group a prospective land's `(push, refs/heads/main)` event
-#     resolves into — so every in-flight main run here is `reaper_at_risk` by
-#     `ci_observer.rs` `run_is_reaper_at_risk`. coord already models the reap
-#     that happens even at `false` (GitHub reaps the oldest PENDING run in a
-#     group); `true` upgrades that from "queued behind" to an actual
-#     cancellation, leaving a `cancelled` conclusion on a main SHA whose
-#     baseline coord then reads as non-success. `qontinui CI` is not on
-#     `BENIGN_SUPERSESSION_WORKFLOWS`, so nothing downgrades that.
+#   - `main`: the group below resolves to `qontinui CI-push-refs/heads/main`,
+#     which is exactly the group a prospective land's `(push, refs/heads/main)`
+#     event resolves into — so every in-flight main run here is
+#     `reaper_at_risk` by `ci_observer.rs` `run_is_reaper_at_risk`. coord
+#     already models the reap that happens even at `false` (GitHub reaps the
+#     oldest PENDING run in a group); `true` upgrades that from "queued
+#     behind" to an actual cancellation, leaving a `cancelled` conclusion on a
+#     main SHA whose baseline coord then reads as non-success. `qontinui CI` is
+#     not on `BENIGN_SUPERSESSION_WORKFLOWS`, so nothing downgrades that.
 #
 # `pull_request` runs are the one lane where cancelling is both safe and worth
 # real money: coord explicitly excludes PR-lane runs from the no-reap blocking
@@ -78,19 +83,35 @@ on:
 # it, and `run_is_reaper_at_risk` keys on the GROUP alone — so the conservative
 # reading costs nothing.
 #
-# THE GROUP CARRIES AN UNSTATED PRECONDITION. `cancel-in-progress` above keys on
-# the EVENT, but the group below keys only on the REF, and that is sufficient
-# today only because no two triggers here can put different event kinds on one
-# ref: `push` runs are `refs/heads/<branch>` and `pull_request` runs are
-# `refs/pull/<n>/merge`, so the PR lane can never share a group with the two
-# lanes this block protects. Adding a `workflow_dispatch:` trigger breaks that -
-# a manual dispatch on `main` resolves to `refs/heads/main` and lands in
-# `qontinui CI-refs/heads/main` alongside the push runs coord's head baseline
-# reads. If you add one, key the GROUP by `github.event_name` too, the way
-# `qontinui-coord/.github/workflows/ci.yml` already does
-# (`ci-${{ github.event_name }}-${{ github.ref }}`).
+# The GROUP coord records is likewise not the string GitHub shows.
+# `resolve_group_template` models `${{ github.event_name }}` and
+# `${{ github.ref }}` and collapses every other `${{ … }}` to empty, so
+# `${{ github.workflow }}` vanishes and coord stores `-push-refs/heads/main` for
+# a main run. That is harmless — coord resolves the in-flight run and the
+# prospective land event through the SAME template, so the equality
+# `run_is_reaper_at_risk` tests is unaffected. Do NOT "fix" it by hardcoding the
+# workflow name into the group: it buys coord nothing, and that name is the
+# check context the merge engine reads (see the top of this file).
+#
+# THE GROUP IS KEYED BY `github.event_name` DELIBERATELY, and must stay so.
+# `cancel-in-progress` keys on the EVENT; a group keyed on the REF alone would
+# hold only by accident — no two triggers in this file can put different event
+# kinds on one ref (`push` -> `refs/heads/<branch>`, `pull_request` ->
+# `refs/pull/<n>/merge`) — and that accident is one plausible edit away from
+# ending. A `workflow_dispatch:` trigger is an entirely reasonable thing to want
+# on a job with `timeout-minutes: 150`, and a manual dispatch on `main` resolves
+# to `refs/heads/main`: under a ref-only group it would join the very group the
+# bullets above exist to protect, the one `run_is_reaper_at_risk` keys on. The
+# expression above would correctly evaluate `cancel-in-progress` to false for
+# that dispatch, but that is not the whole hazard — GitHub reaps the oldest
+# PENDING run in a group even at `false`, so the dispatch is enough to displace
+# an in-flight `main` baseline run on its own. Keying the group by the event
+# makes that structurally impossible instead of a comment somebody has to read
+# first, which is what `qontinui-coord/.github/workflows/ci.yml` already does
+# (`ci-${{ github.event_name }}-${{ github.ref }}`). Adding a trigger is now
+# safe; removing `${{ github.event_name }}` from the group is not.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
