@@ -154,6 +154,7 @@ jobs:
       - name: Checkout sibling repos
         run: |
           cd "$GITHUB_WORKSPACE/.."
+          # Unpinned on purpose: the inspector tracks runner main (it uses runner APIs such as AccessibilityManager::has_native_events as they land there).
           git clone --depth 1 https://github.com/qontinui/qontinui-runner.git
           git clone --depth 1 https://github.com/qontinui/qontinui-schemas.git
         shell: bash
