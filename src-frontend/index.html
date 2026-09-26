@@ -30,6 +30,15 @@
       <button id="capture-btn">Capture Desktop</button>
     </section>
 
+    <section class="overlay-controls">
+      <label title="Outline elements on screen, over the target app"
+        ><input type="checkbox" id="overlay-toggle" checked /> Draw on
+        screen</label
+      >
+      <button id="hide-overlay-btn" class="secondary-btn">Hide outline</button>
+      <span id="overlay-status" class="overlay-status"></span>
+    </section>
+
     <section id="mode-pane">
       <div id="hover-pane" class="pane active">
         <p class="hint">
@@ -41,15 +50,29 @@
       </div>
       <div id="focus-pane" class="pane">
         <p class="hint">
-          Focus tracking: <strong>coming soon</strong>. See Phase 4 of the
-          native-accessibility-expansion plan.
+          Move keyboard focus in any application (Tab, click into a field);
+          the focused element is selected here and outlined in green.
         </p>
+        <button id="focus-toggle-btn" class="action-btn">
+          Start focus tracking
+        </button>
+        <div
+          id="focus-preview"
+          class="highlight-preview highlight-target"
+          hidden
+        >
+          focused (green)
+        </div>
       </div>
       <div id="selector-pane" class="pane">
-        <p class="hint">Enter a ref id to see its selector:</p>
+        <p class="hint">Enter a ref id to select it and see its selector:</p>
         <input id="ref-input" type="text" placeholder="@e1" />
         <button id="get-selector-btn">Get Selector</button>
-        <pre id="selector-output"></pre>
+        <button id="show-matches-btn" class="secondary-btn">
+          Show matches
+        </button>
+        <div id="selector-output" class="selector-view"></div>
+        <pre id="matches-output" class="matches-output"></pre>
       </div>
     </section>
 
@@ -57,6 +80,13 @@
       <h2>
         Property Grid
         <button id="toggle-all-btn" title="Collapse/expand all">[+/-]</button>
+        <button
+          id="select-current-btn"
+          class="secondary-btn"
+          title="Pin the element shown below as the selection (blue)"
+        >
+          Select
+        </button>
       </h2>
       <div id="current-ref" class="current-ref">(no element hovered)</div>
 
@@ -106,7 +136,7 @@
 
       <details data-section="selector" open>
         <summary>Selector</summary>
-        <pre id="prop-selector"></pre>
+        <div id="prop-selector" class="selector-view"></div>
       </details>
     </section>
 

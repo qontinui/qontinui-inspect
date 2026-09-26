@@ -238,12 +238,17 @@ jobs:
         env:
           CARGO_BUILD_JOBS: 2
 
-      # `cargo check`, not `cargo test --all`: this crate has no tests of its
-      # own, and `--all` would drag in the runner workspace's suite, which that
-      # repo's CI already covers and which needs a Postgres service plus several
-      # more sibling checkouts to run. Add a `test` step the day this crate
-      # grows tests of its own.
+      # Never `cargo test --all`: `--all` would drag in the runner workspace's
+      # suite, which that repo's CI already covers and which needs a Postgres
+      # service plus several more sibling checkouts to run.
       - name: Check
         run: cargo check -p qontinui-inspect --all-targets
+        env:
+          CARGO_BUILD_JOBS: 2
+
+      # This crate's own unit tests (selector generation, overlay geometry, tree
+      # walks) — `-p qontinui-inspect` runs only them, not the runner's suite.
+      - name: Test
+        run: cargo test -p qontinui-inspect
         env:
           CARGO_BUILD_JOBS: 2

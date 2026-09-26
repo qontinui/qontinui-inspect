@@ -1,7 +1,7 @@
 [package]
 name = "qontinui-inspect"
 version = "0.1.0"
-description = "Native accessibility inspector for Qontinui (Phase 4 scaffold)"
+description = "Native accessibility inspector for Qontinui"
 authors = ["Qontinui <contact@qontinui.org>"]
 edition = "2021"
 
@@ -19,8 +19,10 @@ resolver = "2"
 # - Frontend is vanilla HTML+JS under `src-frontend/` to avoid a JS toolchain
 #   rabbithole for the scaffold. `cargo build` requires the frontend dir to
 #   exist (it does, see tauri.conf.json `frontendDist`), but no npm step.
-# - The inspector's own Rust-visible UI renders highlight colors (yellow/blue/
-#   green); the in-target-app overlay window is future work (see lib.rs docs).
+# - Highlight colors (yellow/blue/green) render both in the inspector's own UI
+#   and on screen via the lazily created `overlay` window (src/overlay.rs). No
+#   `macos-private-api` feature: it would also require `macOSPrivateApi` in
+#   tauri.conf.json, and the overlay reports itself unsupported on macOS instead.
 
 [build-dependencies]
 tauri-build = { version = "2.5", features = [] }

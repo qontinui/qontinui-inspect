@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>Qontinui Inspector Overlay</title>
+    <!--
+      In-target-app overlay (plan scout-2026-04-16-native-accessibility-expansion,
+      Phase 4c). This page fills a transparent, click-through, always-on-top
+      window that the backend (src/overlay.rs) sizes to the union of the rects
+      it outlines. Each rect is window-relative and already inflated by the
+      border width, so the stroke sits just outside the target element.
+    -->
+    <style>
+      html,
+      body {
+        margin: 0;
+        padding: 0;
+        width: 100%;
+        height: 100%;
+        overflow: hidden;
+        background: transparent;
+        pointer-events: none;
+      }
+      .outline {
+        position: absolute;
+        box-sizing: border-box;
+        border-style: solid;
+        border-radius: 2px;
+      }
+    </style>
+  </head>
+  <body>
+    <script>
+      const { invoke } = window.__TAURI__.core;
+      const { listen } = window.__TAURI__.event;
+
+      // draw = { kind, color, border, rects: [{x, y, width, height}] } | null
+      function render(draw) {
+        document.body.replaceChildren();
+        if (!draw) return;
+        for (const r of draw.rects) {
+          const el = document.createElement("div");
+          el.className = "outline";
+          el.style.left = `${r.x}px`;
+          el.style.top = `${r.y}px`;
+          el.style.width = `${r.width}px`;
+          el.style.height = `${r.height}px`;
+          el.style.borderWidth = `${draw.border}px`;
+          el.style.borderColor = draw.color;
+          document.body.appendChild(el);
+        }
+      }
+
+      // The backend positions the window in PHYSICAL pixels and sends rects in
+      // physical pixels; CSS pixels differ by devicePixelRatio, so scale down.
+      function toCss(draw) {
+        if (!draw) return draw;
+        const k = window.devicePixelRatio || 1;
+        return {
+          ...draw,
+          border: Math.max(1, Math.round(draw.border / k)),
+          rects: draw.rects.map((r) => ({
+            x: r.x / k,
+            y: r.y / k,
+            width: r.width / k,
+            height: r.height / k,
+          })),
+        };
+      }
+
+      // Listen first, then pull the current state, so a draw emitted while
+      // this page was still loading is not lost.
+      listen("overlay-draw", (event) => render(toCss(event.payload)));
+      invoke("get_overlay_state").then((draw) => render(toCss(draw)));
+    </script>
+  </body>
+</html>

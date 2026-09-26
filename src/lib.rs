@@ -1,12 +1,11 @@
-//! Qontinui Inspector — Phase 4 scaffold.
+//! Qontinui Inspector — native accessibility inspector.
 //!
 //! A Tauri application providing FlaUInspect-style inspection of native apps
-//! via the existing `qontinui_runner_lib::accessibility` API. This is the
-//! Phase 4 scaffold, not the full implementation — see
-//! `D:/qontinui-root/plans/scout-2026-04-16-native-accessibility-expansion.md`
-//! section "Phase 4 — Native app inspector UI" for the complete spec.
+//! via the existing `qontinui_runner_lib::accessibility` API. The spec is plan
+//! `scout-2026-04-16-native-accessibility-expansion` (qontinui-dev-notes/plans),
+//! section "Phase 4 — Native app inspector UI".
 //!
-//! # Scope of this scaffold
+//! # Phase 4 status
 //!
 //! - [x] Crate compiles (`cargo check -p qontinui-inspect` passes).
 //! - [x] Tauri window launches (800x600, title "Qontinui Inspector").
@@ -14,23 +13,36 @@
 //! - [x] Hover Mode — implemented end-to-end on Windows using cursor-position
 //!   polling (not a global mouse hook). Polls `GetAsyncKeyState(VK_CONTROL)`
 //!   every ~100ms; when Ctrl is held, emits `element-hovered` events.
+//!   Linux (AT-SPI) and macOS (AX) hit-testing is not wired yet.
 //! - [x] Property grid — reads `role`, `automation_id`, `class_name`, `state`,
-//!   `bounds` from the cached `UnifiedNode`.
+//!   `bounds` from the cached `UnifiedNode`, plus the Show Selector result.
 //! - [x] `tauri-plugin-store` persists `collapsed_sections`.
-//! - [ ] Focus Tracking — stub only (see `start_focus_tracking`).
-//! - [ ] Show Selector — placeholder `@<ref_id>` (see `get_selector_for_ref`).
-//! - [ ] In-target-app overlay drawing (the Phase 4 novel piece — transparent
-//!   overlay window + GDI paint loop) is deferred. For now, highlight
-//!   colors render only in the inspector's own UI:
-//!   - hover    = yellow  (#eab308)
-//!   - selected = blue    (#3b82f6)
-//!   - focused  = green   (#10b981)  -- reserved, not yet emitted
+//! - [x] 4a Focus Tracking — `start_focus_tracking` / `stop_focus_tracking`
+//!   emit `element-focused` (see `focus.rs` for where the events come from and
+//!   how the focused node is resolved).
+//! - [x] 4b.2 Show Selector — `get_selector_for_ref` returns the
+//!   `native_accessibility` `query` step fragment that re-finds the element,
+//!   with its match count against the cached snapshot (see `selector.rs`).
+//! - [x] 4c In-target-app overlay — a transparent, click-through, always-on-top
+//!   `overlay` window outlines elements on screen (see `overlay.rs`), in the
+//!   same palette as the in-UI highlights: hover yellow (#eab308), selected
+//!   blue (#3b82f6), focused / selector match green (#10b981). Unsupported
+//!   on macOS (no `macos-private-api`) and on Linux Wayland sessions; those
+//!   return `overlay unsupported on <os>: <reason>` and the in-UI
+//!   highlighting remains.
 //!
 //! # Architecture note
 //!
 //! Consumes the runner's `AccessibilityManager` public API only
 //! (`qontinui_runner_lib::accessibility`). Does NOT touch any adapter files,
-//! matching the parallel-Phase-2 refactor constraint in the plan.
+//! matching the parallel-Phase-2 refactor constraint in the plan. Focus
+//! tracking opens its own platform adapter through the public
+//! `adapters::create_platform_adapter` factory, as an event source only.
+
+pub mod focus;
+pub mod overlay;
+pub mod selector;
+pub mod tree;
 
 use std::sync::Arc;
 use tauri::{Emitter, Manager};
@@ -43,11 +55,15 @@ use qontinui_runner_lib::accessibility::{
     AccessibilityManager,
 };
 
+use crate::overlay::{OverlayDraw, OverlayKind, OverlayState};
+use crate::selector::SelectorInfo;
+use crate::tree::find_deepest_at;
+
 // -----------------------------------------------------------------------------
 // Shared state
 // -----------------------------------------------------------------------------
 
-/// Shared accessibility manager + hover-loop control flag.
+/// Shared accessibility manager + mode control.
 ///
 /// Tauri stores this via `app.manage(InspectorState::new())`.
 pub struct InspectorState {
@@ -57,6 +73,13 @@ pub struct InspectorState {
     /// When `true`, the hover loop task polls cursor position + Ctrl key.
     /// Setting to `false` lets the spawned task exit on its next tick.
     hover_active: Arc<std::sync::atomic::AtomicBool>,
+
+    /// The running focus-tracking task, if any. Stopping signals it and waits
+    /// for it to release its event adapter.
+    focus_task: Mutex<Option<focus::FocusTask>>,
+
+    /// Last overlay draw, pulled by the overlay page when it loads.
+    overlay: OverlayState,
 }
 
 impl InspectorState {
@@ -64,6 +87,8 @@ impl InspectorState {
         Self {
             manager: Mutex::new(AccessibilityManager::new()),
             hover_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            focus_task: Mutex::new(None),
+            overlay: OverlayState::default(),
         }
     }
 }
@@ -81,7 +106,8 @@ impl Default for InspectorState {
 /// Serializable snapshot of a `UnifiedNode`'s inspect-relevant fields.
 ///
 /// Mirrors the property-grid sections shown by `ui-bridge/src/debug/inspector.tsx`
-/// (identifier / state / bounds) for UX parity with the web inspector.
+/// (identifier / state / bounds) for UX parity with the web inspector. It is
+/// the payload of both `element-hovered` and `element-focused`.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct PropertyGrid {
     pub ref_id: String,
@@ -94,13 +120,19 @@ pub struct PropertyGrid {
     pub bounds: Option<UnifiedBounds>,
     pub state: UnifiedState,
     pub is_interactive: bool,
-    /// Placeholder qontinui-selector. Phase 4 full scope will replace this
-    /// with the real selector grammar (see `get_selector_for_ref` TODO).
-    pub selector: String,
+    /// Show Selector result — the same value `get_selector_for_ref` returns.
+    /// `None` only for a focus event that could not be resolved to a node.
+    pub selector: Option<SelectorInfo>,
+    /// Set when the grid was not read from a captured node (an unresolved
+    /// focus event); says why.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
 }
 
 impl PropertyGrid {
-    fn from_node(node: &UnifiedNode) -> Self {
+    /// Build the grid for `node`, computing its selector against `root` (the
+    /// snapshot root the node was found in).
+    pub fn from_node(node: &UnifiedNode, root: &UnifiedNode) -> Self {
         Self {
             ref_id: node.ref_id.clone(),
             role: node.role.as_str().to_string(),
@@ -112,33 +144,10 @@ impl PropertyGrid {
             bounds: node.bounds.clone(),
             state: node.state.clone(),
             is_interactive: node.is_interactive,
-            selector: format!("@{}", node.ref_id),
+            selector: Some(selector::selector_for(node, root)),
+            note: None,
         }
     }
-}
-
-// -----------------------------------------------------------------------------
-// Tree walk: find the deepest node whose bounds contain (x, y).
-// -----------------------------------------------------------------------------
-
-fn node_contains(node: &UnifiedNode, x: i32, y: i32) -> bool {
-    match &node.bounds {
-        Some(b) => x >= b.x && x < b.x + b.width && y >= b.y && y < b.y + b.height,
-        None => false,
-    }
-}
-
-fn find_deepest_at(node: &UnifiedNode, x: i32, y: i32) -> Option<&UnifiedNode> {
-    if !node_contains(node, x, y) {
-        return None;
-    }
-    // Prefer the deepest matching descendant.
-    for child in &node.children {
-        if let Some(hit) = find_deepest_at(child, x, y) {
-            return Some(hit);
-        }
-    }
-    Some(node)
 }
 
 // -----------------------------------------------------------------------------
@@ -232,24 +241,62 @@ async fn stop_hover_mode(state: tauri::State<'_, InspectorState>) -> Result<(), 
     Ok(())
 }
 
-/// Scaffold — logs a warning and returns Ok. See plan phase 4 item 2 bullet 2:
-/// requires subscribing to `UIA_AutomationFocusChangedEventId`, which needs
-/// UIA event-sink glue that isn't wired through the current
-/// `PlatformAdapter::subscribe_events` surface for focus-change events yet.
+/// Start Focus Tracking: emit `element-focused` (a `PropertyGrid`) whenever
+/// keyboard focus moves. Restarts cleanly if already running. See `focus.rs`.
 #[tauri::command]
-async fn start_focus_tracking() -> Result<(), String> {
-    warn!("Focus tracking not implemented yet — see plan phase 4");
+async fn start_focus_tracking(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, InspectorState>,
+) -> Result<(), String> {
+    let mut slot = state.focus_task.lock().await;
+    if let Some(previous) = slot.take() {
+        previous.stop().await;
+    }
+    *slot = Some(focus::spawn(app.clone()).await?);
     Ok(())
 }
 
-/// Scaffold — returns `@<ref_id>` as a placeholder. Full Phase 4 scope: emit
-/// a qontinui-selector string (role, automation_id, ancestor chain, etc.)
-/// matching the grammar the runner's selector engine speaks.
+/// Stop Focus Tracking. A no-op when it is not running.
 #[tauri::command]
-async fn get_selector_for_ref(ref_id: String) -> Result<String, String> {
-    // TODO(phase4): generate real qontinui-selector (role + automation_id +
-    // ancestor chain with :nth-of-type disambiguation). See plan.
-    Ok(format!("@{}", ref_id))
+async fn stop_focus_tracking(state: tauri::State<'_, InspectorState>) -> Result<(), String> {
+    let task = state.focus_task.lock().await.take();
+    if let Some(task) = task {
+        task.stop().await;
+    }
+    Ok(())
+}
+
+/// Find `ref_id` (with or without its leading `@` — see `tree::normalize_ref`;
+/// the ref manager's refs carry it) in the cached snapshot and
+/// hand it, with the snapshot root, to `f`.
+async fn with_cached_node<T>(
+    state: &InspectorState,
+    ref_id: &str,
+    f: impl FnOnce(&UnifiedNode, &UnifiedNode) -> T,
+) -> Result<T, String> {
+    let mgr = state.manager.lock().await;
+    let snap = mgr
+        .snapshot()
+        .await
+        .ok_or_else(|| "no tree captured yet — call capture_desktop first".to_string())?;
+    let node = snap
+        .root
+        .find_by_ref(&tree::normalize_ref(ref_id))
+        .ok_or_else(|| format!("ref not found: {}", ref_id))?;
+    Ok(f(node, &snap.root))
+}
+
+/// Show Selector: the `native_accessibility` `query` step fragment that
+/// re-finds the element, plus how many cached nodes it matches, e.g.
+/// `{ "step": {"a11y_action": "query", "a11y_query_automation_id": "btn_ok"},
+///    "strategy": "automation_id", "match_count": 1, "unique": true,
+///    "session_ref": "@e3", "session_ref_note": "..." }`. See `selector.rs`.
+#[tauri::command]
+async fn get_selector_for_ref(
+    ref_id: String,
+    state: tauri::State<'_, InspectorState>,
+) -> Result<SelectorInfo, String> {
+    with_cached_node(&state, &ref_id, selector::selector_for).await
 }
 
 /// Return a property-grid snapshot for the node identified by `ref_id`.
@@ -258,16 +305,84 @@ async fn get_property_grid(
     ref_id: String,
     state: tauri::State<'_, InspectorState>,
 ) -> Result<PropertyGrid, String> {
-    let mgr = state.manager.lock().await;
-    let snap = mgr
-        .snapshot()
-        .await
-        .ok_or_else(|| "no tree captured yet — call capture_desktop first".to_string())?;
-    let node = snap
-        .root
-        .find_by_ref(&ref_id)
-        .ok_or_else(|| format!("ref not found: {}", ref_id))?;
-    Ok(PropertyGrid::from_node(node))
+    with_cached_node(&state, &ref_id, PropertyGrid::from_node).await
+}
+
+// -----------------------------------------------------------------------------
+// In-target-app overlay (Phase 4c)
+// -----------------------------------------------------------------------------
+
+/// Outline `bounds` (screen coordinates, one or more rects) on screen in
+/// `kind`'s colour. Errors with `overlay unsupported on <os>: <reason>` on a
+/// platform that cannot do it.
+#[tauri::command]
+async fn show_overlay(
+    bounds: Vec<UnifiedBounds>,
+    kind: OverlayKind,
+    app: tauri::AppHandle,
+    state: tauri::State<'_, InspectorState>,
+) -> Result<OverlayDraw, String> {
+    overlay::show(&app, &state.overlay, &bounds, kind)
+}
+
+/// Hide the overlay.
+#[tauri::command]
+async fn hide_overlay(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, InspectorState>,
+) -> Result<(), String> {
+    overlay::hide(&app, &state.overlay)
+}
+
+/// What the overlay should currently draw — pulled by `overlay.html` on load,
+/// so a draw emitted before the page was listening is not lost.
+#[tauri::command]
+async fn get_overlay_state(
+    state: tauri::State<'_, InspectorState>,
+) -> Result<Option<OverlayDraw>, String> {
+    Ok(state.overlay.last())
+}
+
+/// Result of `show_selector_matches`.
+#[derive(Debug, Clone, serde::Serialize)]
+struct SelectorMatches {
+    selector: SelectorInfo,
+    /// Refs of every match (session refs, for display only).
+    match_refs: Vec<String>,
+    /// How many matches had bounds and were outlined.
+    drawn: usize,
+    /// Why nothing was drawn on screen, when it was not (unsupported platform
+    /// or no bounds). The match data above is valid either way.
+    overlay_error: Option<String>,
+}
+
+/// "Show matches": run the element's selector against the cached snapshot and
+/// outline every match on screen in green.
+#[tauri::command]
+async fn show_selector_matches(
+    ref_id: String,
+    app: tauri::AppHandle,
+    state: tauri::State<'_, InspectorState>,
+) -> Result<SelectorMatches, String> {
+    let (info, refs, rects) = with_cached_node(&state, &ref_id, |node, root| {
+        let info = selector::selector_for(node, root);
+        let hits = selector::find_matches(&info.step, root).unwrap_or_default();
+        let refs = hits
+            .iter()
+            .map(|n| tree::normalize_ref(&n.ref_id))
+            .collect();
+        let rects = tree::bounds_of(&hits);
+        (info, refs, rects)
+    })
+    .await?;
+    let drawn = rects.iter().filter(|b| b.width > 0 && b.height > 0).count();
+    let overlay_error = overlay::show(&app, &state.overlay, &rects, OverlayKind::Match).err();
+    Ok(SelectorMatches {
+        selector: info,
+        match_refs: refs,
+        drawn: if overlay_error.is_some() { 0 } else { drawn },
+        overlay_error,
+    })
 }
 
 /// Persist the list of property-grid section IDs currently collapsed, via
@@ -353,7 +468,9 @@ async fn windows_hover_loop(
         let grid_opt = if let Some(state) = app.try_state::<InspectorState>() {
             let mgr = state.manager.lock().await;
             let snap = mgr.snapshot().await;
-            snap.and_then(|s| find_deepest_at(&s.root, pt.x, pt.y).map(PropertyGrid::from_node))
+            snap.and_then(|s| {
+                find_deepest_at(&s.root, pt.x, pt.y).map(|n| PropertyGrid::from_node(n, &s.root))
+            })
         } else {
             None
         };
@@ -393,10 +510,15 @@ pub fn run() {
             start_hover_mode,
             stop_hover_mode,
             start_focus_tracking,
+            stop_focus_tracking,
             get_selector_for_ref,
             get_property_grid,
             save_collapse_state,
             load_collapse_state,
+            show_overlay,
+            hide_overlay,
+            get_overlay_state,
+            show_selector_matches,
         ])
         .setup(|app| {
             info!("Qontinui Inspector starting");

@@ -1,7 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Default capability for the inspector window",
-  "windows": ["main"],
+  "description": "Default capability for the inspector window and its in-target overlay window (the overlay page listens for overlay-draw and pulls get_overlay_state)",
+  "windows": ["main", "overlay"],
   "permissions": ["core:default", "store:default"]
 }

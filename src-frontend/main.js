@@ -5,10 +5,16 @@
 //   - get_backend_name
 //   - capture_desktop
 //   - start_hover_mode / stop_hover_mode
-//   - start_focus_tracking (scaffold)
-//   - get_selector_for_ref
+//   - start_focus_tracking / stop_focus_tracking
+//   - get_selector_for_ref / show_selector_matches
 //   - get_property_grid
+//   - show_overlay / hide_overlay
 //   - save_collapse_state / load_collapse_state
+//
+// Events listened to: element-hovered, element-focused.
+//
+// Highlight palette (in-UI and on-screen overlay alike):
+//   hover yellow #eab308, selected blue #3b82f6, focus / match green #10b981.
 
 const { invoke } = window.__TAURI__.core;
 const { listen } = window.__TAURI__.event;
@@ -24,9 +30,17 @@ const paneSelector = document.getElementById("selector-pane");
 const captureBtn = document.getElementById("capture-btn");
 const refInput = document.getElementById("ref-input");
 const getSelectorBtn = document.getElementById("get-selector-btn");
+const showMatchesBtn = document.getElementById("show-matches-btn");
 const selectorOutput = document.getElementById("selector-output");
+const matchesOutput = document.getElementById("matches-output");
 const toggleAllBtn = document.getElementById("toggle-all-btn");
+const selectCurrentBtn = document.getElementById("select-current-btn");
 const currentRefEl = document.getElementById("current-ref");
+const focusToggleBtn = document.getElementById("focus-toggle-btn");
+const focusPreview = document.getElementById("focus-preview");
+const overlayToggle = document.getElementById("overlay-toggle");
+const hideOverlayBtn = document.getElementById("hide-overlay-btn");
+const overlayStatusEl = document.getElementById("overlay-status");
 
 const propRef = document.getElementById("prop-ref");
 const propRole = document.getElementById("prop-role");
@@ -45,9 +59,87 @@ const panes = {
   selector: paneSelector,
 };
 
+// Refs from the runner's ref manager already carry the sigil ("@e3"); users
+// may type them either way. Display every ref with exactly one "@".
+function refLabel(ref) {
+  return `@${String(ref).trim().replace(/^@+/, "")}`;
+}
+
+// The grid currently shown, and why it is shown ("hover" | "selected" |
+// "focus"), which fixes its highlight colour.
+let shownGrid = null;
+let shownKind = null;
+
+// ---- On-screen overlay ------------------------------------------------------
+
+// Sticky once the backend reports the platform unsupported, so every hover
+// does not re-ask; in-UI highlighting keeps working regardless.
+let overlayUnsupported = null;
+
+async function drawOverlay(boundsList, kind) {
+  if (!overlayToggle.checked || overlayUnsupported) return;
+  const rects = boundsList.filter((b) => b && b.width > 0 && b.height > 0);
+  if (rects.length === 0) {
+    await hideOverlay();
+    return;
+  }
+  try {
+    await invoke("show_overlay", { bounds: rects, kind });
+    overlayStatusEl.textContent = `outlined (${kind})`;
+  } catch (e) {
+    const msg = String(e);
+    if (msg.startsWith("overlay unsupported on")) {
+      overlayUnsupported = msg;
+    }
+    overlayStatusEl.textContent = msg;
+  }
+}
+
+async function hideOverlay() {
+  try {
+    await invoke("hide_overlay");
+  } catch (e) {
+    console.warn("hide_overlay failed:", e);
+  }
+  if (!overlayUnsupported) overlayStatusEl.textContent = "";
+}
+
+overlayToggle.addEventListener("change", () => {
+  if (!overlayToggle.checked) {
+    hideOverlay();
+  } else if (shownGrid && shownGrid.bounds) {
+    drawOverlay([shownGrid.bounds], shownKind);
+  }
+});
+hideOverlayBtn.addEventListener("click", hideOverlay);
+
 // ---- Mode handling ----------------------------------------------------------
 
 let currentMode = "hover";
+let focusTracking = false;
+
+async function startFocusTracking() {
+  try {
+    await invoke("start_focus_tracking");
+    focusTracking = true;
+    focusToggleBtn.textContent = "Stop focus tracking";
+    statusEl.textContent = "focus tracking active";
+  } catch (e) {
+    focusTracking = false;
+    focusToggleBtn.textContent = "Start focus tracking";
+    statusEl.textContent = `focus tracking error: ${e}`;
+  }
+}
+
+async function stopFocusTracking() {
+  try {
+    await invoke("stop_focus_tracking");
+  } catch (e) {
+    console.warn("stop_focus_tracking failed:", e);
+  }
+  focusTracking = false;
+  focusToggleBtn.textContent = "Start focus tracking";
+}
 
 function setMode(mode) {
   currentMode = mode;
@@ -62,9 +154,9 @@ function setMode(mode) {
     invoke("stop_hover_mode");
   }
   if (mode === "focus") {
-    invoke("start_focus_tracking").then(() => {
-      statusEl.textContent = "focus tracking stub — see plan phase 4";
-    });
+    startFocusTracking();
+  } else if (focusTracking) {
+    stopFocusTracking();
   }
   if (mode === "selector") {
     statusEl.textContent = "selector mode";
@@ -74,6 +166,16 @@ function setMode(mode) {
 for (const radio of modeRadios) {
   radio.addEventListener("change", (e) => setMode(e.target.value));
 }
+
+focusToggleBtn.addEventListener("click", () => {
+  if (focusTracking) {
+    stopFocusTracking().then(() => {
+      statusEl.textContent = "focus tracking stopped";
+    });
+  } else {
+    startFocusTracking();
+  }
+});
 
 // ---- Capture ----------------------------------------------------------------
 
@@ -87,21 +189,94 @@ captureBtn.addEventListener("click", async () => {
   }
 });
 
-// ---- Selector ---------------------------------------------------------------
+// ---- Selector rendering -----------------------------------------------------
+
+async function copyText(text) {
+  try {
+    await navigator.clipboard.writeText(text);
+    return true;
+  } catch (_) {
+    // Fallback for webviews without the async clipboard API.
+    const ta = document.createElement("textarea");
+    ta.value = text;
+    document.body.appendChild(ta);
+    ta.select();
+    const ok = document.execCommand("copy");
+    ta.remove();
+    return ok;
+  }
+}
+
+// Render a SelectorInfo ({step, strategy, match_count, unique, session_ref,
+// session_ref_note}) into `container`: pretty JSON, a unique/ambiguous badge,
+// and a copy button.
+function renderSelector(container, info) {
+  container.replaceChildren();
+  if (!info) {
+    const p = document.createElement("p");
+    p.className = "hint";
+    p.textContent = "(no selector — element not resolved in the tree)";
+    container.appendChild(p);
+    return;
+  }
+  const json = JSON.stringify(info.step, null, 2);
+
+  const bar = document.createElement("div");
+  bar.className = "selector-bar";
+
+  const badge = document.createElement("span");
+  badge.className = `badge ${info.unique ? "badge-unique" : "badge-ambiguous"}`;
+  badge.textContent = info.unique
+    ? "unique"
+    : info.match_count === 0
+      ? "no match"
+      : `ambiguous (${info.match_count} matches)`;
+  badge.title = `strategy: ${info.strategy}; ${info.match_count} match(es) in the cached snapshot`;
+  bar.appendChild(badge);
+
+  const copyBtn = document.createElement("button");
+  copyBtn.className = "secondary-btn";
+  copyBtn.textContent = "Copy";
+  copyBtn.addEventListener("click", async () => {
+    const ok = await copyText(json);
+    copyBtn.textContent = ok ? "Copied" : "Copy failed";
+    setTimeout(() => (copyBtn.textContent = "Copy"), 1200);
+  });
+  bar.appendChild(copyBtn);
+  container.appendChild(bar);
+
+  const pre = document.createElement("pre");
+  pre.className = "selector-json";
+  pre.textContent = json;
+  container.appendChild(pre);
+
+  const ref = document.createElement("p");
+  ref.className = "hint session-ref";
+  ref.textContent = `${info.session_ref} — ${info.session_ref_note}`;
+  container.appendChild(ref);
+}
+
+// ---- Selector pane ----------------------------------------------------------
+
+// The backend accepts refs with or without "@", so pass the input through.
+function refFromInput() {
+  return refInput.value.trim();
+}
 
 getSelectorBtn.addEventListener("click", async () => {
-  const refId = refInput.value.replace(/^@/, "").trim();
+  const refId = refFromInput();
+  matchesOutput.textContent = "";
   if (!refId) {
     selectorOutput.textContent = "(enter a ref id)";
     return;
   }
   try {
-    const sel = await invoke("get_selector_for_ref", { refId });
-    selectorOutput.textContent = sel;
-    // Also populate property grid if we can.
+    const info = await invoke("get_selector_for_ref", { refId });
+    renderSelector(selectorOutput, info);
+    // Entering a ref selects that element (blue).
     try {
       const grid = await invoke("get_property_grid", { refId });
-      renderPropertyGrid(grid);
+      showGrid(grid, "selected");
     } catch (_) {
       // ignore — grid may not be loaded
     }
@@ -110,10 +285,43 @@ getSelectorBtn.addEventListener("click", async () => {
   }
 });
 
+showMatchesBtn.addEventListener("click", async () => {
+  const refId = refFromInput() || (shownGrid && shownGrid.ref_id);
+  if (!refId) {
+    matchesOutput.textContent = "(enter a ref id or select an element)";
+    return;
+  }
+  try {
+    const res = await invoke("show_selector_matches", { refId });
+    renderSelector(selectorOutput, res.selector);
+    const lines = [
+      `${res.match_refs.length} match(es): ${res.match_refs.join(", ")}`,
+    ];
+    if (res.overlay_error) {
+      lines.push(`on-screen outline unavailable: ${res.overlay_error}`);
+      overlayStatusEl.textContent = res.overlay_error;
+    } else {
+      lines.push(`outlined ${res.drawn} on screen (green)`);
+      overlayStatusEl.textContent = "outlined (match)";
+    }
+    matchesOutput.textContent = lines.join("\n");
+  } catch (e) {
+    matchesOutput.textContent = `error: ${e}`;
+  }
+});
+
 // ---- Property grid ----------------------------------------------------------
 
+const KIND_CLASS = {
+  hover: "highlight-hover",
+  selected: "highlight-selected",
+  focus: "highlight-target",
+};
+
 function renderPropertyGrid(grid) {
-  currentRefEl.textContent = `@${grid.ref_id}`;
+  currentRefEl.textContent = grid.ref_id
+    ? refLabel(grid.ref_id)
+    : grid.note || "(unresolved element)";
   propRef.textContent = grid.ref_id;
   propRole.textContent = grid.role;
   propName.textContent = grid.name ?? "";
@@ -125,15 +333,51 @@ function renderPropertyGrid(grid) {
   propBounds.textContent = grid.bounds
     ? JSON.stringify(grid.bounds, null, 2)
     : "(no bounds)";
-  propSelector.textContent = grid.selector;
+  renderSelector(propSelector, grid.selector);
 }
 
-// ---- Hover events -----------------------------------------------------------
+// Show `grid` in the property grid, highlighted as `kind`, and outline it on
+// screen in the same colour.
+function showGrid(grid, kind) {
+  shownGrid = grid;
+  shownKind = kind;
+  renderPropertyGrid(grid);
+  currentRefEl.classList.remove(...Object.values(KIND_CLASS));
+  currentRefEl.classList.add("current-ref-badge", KIND_CLASS[kind]);
+  if (grid.bounds) {
+    drawOverlay([grid.bounds], kind);
+  } else {
+    hideOverlay();
+  }
+}
+
+selectCurrentBtn.addEventListener("click", () => {
+  if (shownGrid && shownGrid.ref_id) {
+    showGrid(shownGrid, "selected");
+    refInput.value = refLabel(shownGrid.ref_id);
+    statusEl.textContent = `selected ${refLabel(shownGrid.ref_id)}`;
+  }
+});
+
+// ---- Backend events ---------------------------------------------------------
 
 listen("element-hovered", (event) => {
   const grid = event.payload;
-  renderPropertyGrid(grid);
-  statusEl.textContent = `hovered @${grid.ref_id} (${grid.role})`;
+  showGrid(grid, "hover");
+  statusEl.textContent = `hovered ${refLabel(grid.ref_id)} (${grid.role})`;
+});
+
+listen("element-focused", (event) => {
+  const grid = event.payload;
+  // Auto-select the focused element.
+  showGrid(grid, "focus");
+  focusPreview.hidden = false;
+  focusPreview.textContent = grid.ref_id
+    ? `focused ${refLabel(grid.ref_id)} (${grid.role}${grid.name ? ` "${grid.name}"` : ""})`
+    : `focused: ${grid.note ?? "unresolved"}`;
+  statusEl.textContent = grid.ref_id
+    ? `focused ${refLabel(grid.ref_id)} (${grid.role})`
+    : "focus changed (unresolved)";
 });
 
 // ---- Collapse state persistence --------------------------------------------
