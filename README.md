@@ -40,9 +40,11 @@ cargo tauri dev            # full app (needs frontend build toolchain)
   property grid updates live. **Select** pins the shown element (blue).
 - **Focus Tracking** — while the mode is active, every keyboard-focus change in
   any application selects the focused element in the property grid and
-  outlines it in green. Events come from the platform adapter's focus stream
-  (UIA focus-changed handler on Windows, AT-SPI `Event.Focus` on Linux); where
-  a platform has no event stream (macOS today) it polls the tree once a second.
+  outlines it in green. Events come from the runner's `AccessibilityManager`
+  event bus, which forwards the platform adapter's focus stream (UIA
+  focus-changed handler on Windows, AT-SPI `Event.Focus` on Linux); where the
+  connected adapter has no event stream (macOS AX and Java/JAB today) it polls
+  the tree once a second.
   An event that cannot be resolved to a captured node is still shown, marked
   unresolved.
 - **Show Selector** — for any element, the `native_accessibility` workflow step

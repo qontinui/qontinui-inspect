@@ -36,8 +36,9 @@
 //! Consumes the runner's `AccessibilityManager` public API only
 //! (`qontinui_runner_lib::accessibility`). Does NOT touch any adapter files,
 //! matching the parallel-Phase-2 refactor constraint in the plan. Focus
-//! tracking opens its own platform adapter through the public
-//! `adapters::create_platform_adapter` factory, as an event source only.
+//! tracking takes its events from `AccessibilityManager::subscribe()`, which
+//! carries the native adapter's own event stream, and polls when
+//! `has_native_events()` is `false`.
 
 pub mod focus;
 pub mod overlay;
@@ -75,7 +76,7 @@ pub struct InspectorState {
     hover_active: Arc<std::sync::atomic::AtomicBool>,
 
     /// The running focus-tracking task, if any. Stopping signals it and waits
-    /// for it to release its event adapter.
+    /// for it to exit.
     focus_task: Mutex<Option<focus::FocusTask>>,
 
     /// Last overlay draw, pulled by the overlay page when it loads.

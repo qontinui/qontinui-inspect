@@ -1,22 +1,20 @@
 //! Focus Tracking (plan Phase 4a).
 //!
-//! # Where focus events actually come from
+//! # Where focus events come from
 //!
-//! The brief for this mode is "subscribe to `AccessibilityManager::subscribe()`
-//! and react to `A11yEvent::FocusChanged`". That subscription is held here, but
-//! on its own it would never fire: as of this writing the manager's broadcast
-//! channel carries only what the manager itself sends (`ConnectionChanged`,
-//! `TreeReplaced`). Nothing forwards the platform adapter's
-//! `PlatformAdapter::subscribe_events()` stream into it, and the manager's
-//! adapter is private. So this task ALSO opens a dedicated platform adapter,
-//! connected to the desktop, purely as an event source, and merges both
-//! streams. If the runner later starts forwarding adapter events into the
-//! manager's bus, the two sources may report the same change; the task
-//! de-duplicates by resolved ref, so that is harmless.
+//! The task consumes `AccessibilityManager::subscribe()` only and reacts to
+//! `A11yEvent::FocusChanged`. The manager forwards its native adapter's
+//! `PlatformAdapter::subscribe_events()` stream into that bus (UIA focus-changed
+//! handler on Windows, AT-SPI `Event.Focus` on Linux), so no second adapter is
+//! opened here.
 //!
-//! Where the platform adapter has no event stream (the macOS AX adapter
-//! returns `None` today), the task falls back to polling: it re-captures every
-//! [`POLL_INTERVAL`] and reports when the focused node changes.
+//! Where the connected adapter has no event stream
+//! (`AccessibilityManager::has_native_events()` is `false` — the macOS AX and
+//! JAB adapters today, or a stream that ended), the task falls back to
+//! polling: it re-captures every [`POLL_INTERVAL`] and reports when the focused
+//! node changes. The check is made on every tick rather than once at start, so
+//! a reconnect elsewhere in the inspector (to a target whose adapter does or
+//! does not stream) switches between the two modes by itself.
 //!
 //! # Resolving the focused node
 //!
@@ -38,15 +36,14 @@
 use std::time::Duration;
 
 use tauri::{Emitter, Manager};
-use tokio::sync::{broadcast, mpsc, oneshot};
+use tokio::sync::{broadcast, oneshot};
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
 use qontinui_runner_lib::accessibility::{
-    adapters::create_platform_adapter,
     events::A11yEvent,
     model::{NodeSource, UnifiedNode, UnifiedRole, UnifiedState},
-    traits::{ConnectionTarget, PlatformAdapter},
+    traits::ConnectionTarget,
 };
 
 use crate::tree::{find_focused, find_unique_by_name, normalize_ref};
@@ -59,7 +56,7 @@ pub const ELEMENT_FOCUSED_EVENT: &str = "element-focused";
 /// Quiet period after the last focus event before resolving.
 pub const DEBOUNCE: Duration = Duration::from_millis(150);
 
-/// Re-capture period when the platform offers no event stream.
+/// Re-capture period when the connected adapter offers no event stream.
 pub const POLL_INTERVAL: Duration = Duration::from_millis(1000);
 
 /// A running focus-tracking task and its stop signal.
@@ -69,8 +66,9 @@ pub struct FocusTask {
 }
 
 impl FocusTask {
-    /// Signal the task to stop and wait for it to release its event adapter.
-    /// Falls back to aborting it if it does not exit promptly.
+    /// Signal the task to stop and wait for it to exit. Falls back to aborting
+    /// it if it does not exit promptly (e.g. it is waiting on the manager lock
+    /// behind a slow capture).
     pub async fn stop(self) {
         let _ = self.stop.send(());
         let mut handle = self.handle;
@@ -109,65 +107,41 @@ pub async fn spawn(app: tauri::AppHandle) -> Result<FocusTask, String> {
                 warn!("initial capture for focus tracking failed: {}", e);
             }
         }
+        if mgr.has_native_events() {
+            info!("focus: using {} focus events", mgr.backend_name());
+        } else {
+            info!(
+                "focus: {} adapter has no event stream — polling every {:?}",
+                mgr.backend_name(),
+                POLL_INTERVAL
+            );
+        }
         mgr.subscribe()
     };
 
-    let (event_adapter, adapter_rx) = open_event_adapter().await;
     let (stop_tx, stop_rx) = oneshot::channel();
-    let handle = tokio::spawn(run(app, bus, event_adapter, adapter_rx, stop_rx));
+    let handle = tokio::spawn(run(app, bus, stop_rx));
     Ok(FocusTask {
         stop: stop_tx,
         handle,
     })
 }
 
-/// Open a platform adapter used only for its event stream.
-async fn open_event_adapter() -> (
-    Option<Box<dyn PlatformAdapter>>,
-    Option<mpsc::Receiver<A11yEvent>>,
-) {
-    let mut adapter = create_platform_adapter();
-    if let Err(e) = adapter.connect(ConnectionTarget::Desktop, 5000).await {
-        warn!(
-            "focus: event adapter ({}) failed to connect: {} — polling instead",
-            adapter.backend_name(),
-            e
-        );
-        return (None, None);
-    }
-    match adapter.subscribe_events().await {
-        Ok(Some(rx)) => {
-            info!(
-                "focus: subscribed to {} focus events",
-                adapter.backend_name()
-            );
-            (Some(adapter), Some(rx))
-        }
-        Ok(None) => {
-            info!(
-                "focus: {} adapter has no event stream — polling every {:?}",
-                adapter.backend_name(),
-                POLL_INTERVAL
-            );
-            let _ = adapter.disconnect().await;
-            (None, None)
-        }
-        Err(e) => {
-            warn!("focus: event subscription failed: {} — polling instead", e);
-            let _ = adapter.disconnect().await;
-            (None, None)
-        }
-    }
+/// Whether a poll tick should re-capture: connected, but with no live native
+/// event stream to wait on.
+async fn should_poll(app: &tauri::AppHandle) -> bool {
+    let Some(state) = app.try_state::<InspectorState>() else {
+        return false;
+    };
+    let mgr = state.manager.lock().await;
+    mgr.is_connected() && !mgr.has_native_events()
 }
 
 async fn run(
     app: tauri::AppHandle,
     mut bus: broadcast::Receiver<A11yEvent>,
-    mut event_adapter: Option<Box<dyn PlatformAdapter>>,
-    mut adapter_rx: Option<mpsc::Receiver<A11yEvent>>,
     mut stop_rx: oneshot::Receiver<()>,
 ) {
-    let polling = adapter_rx.is_none();
     let mut bus_open = true;
     let mut poll = tokio::time::interval(POLL_INTERVAL);
     poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -188,24 +162,17 @@ async fn run(
                 Err(broadcast::error::RecvError::Lagged(n)) => {
                     debug!("focus: manager bus lagged by {}", n);
                 }
-                Err(broadcast::error::RecvError::Closed) => bus_open = false,
-            },
-
-            ev = recv_opt(&mut adapter_rx), if adapter_rx.is_some() => match ev {
-                Some(A11yEvent::FocusChanged { ref_id, node_name }) => {
-                    pending = Some(FocusHint::Event { ref_id, node_name });
-                    deadline = tokio::time::Instant::now() + DEBOUNCE;
-                }
-                Some(_) => {}
-                None => {
-                    warn!("focus: platform event stream ended");
-                    adapter_rx = None;
+                Err(broadcast::error::RecvError::Closed) => {
+                    warn!("focus: manager event bus closed");
+                    bus_open = false;
                 }
             },
 
-            _ = poll.tick(), if polling && pending.is_none() => {
-                pending = Some(FocusHint::Poll);
-                deadline = tokio::time::Instant::now();
+            _ = poll.tick(), if pending.is_none() => {
+                if should_poll(&app).await {
+                    pending = Some(FocusHint::Poll);
+                    deadline = tokio::time::Instant::now();
+                }
             }
 
             _ = tokio::time::sleep_until(deadline), if pending.is_some() => {
@@ -225,20 +192,7 @@ async fn run(
         }
     }
 
-    if let Some(mut adapter) = event_adapter.take() {
-        drop(adapter_rx);
-        if let Err(e) = adapter.disconnect().await {
-            debug!("focus: event adapter disconnect: {}", e);
-        }
-    }
     info!("focus tracking stopped");
-}
-
-async fn recv_opt(rx: &mut Option<mpsc::Receiver<A11yEvent>>) -> Option<A11yEvent> {
-    match rx {
-        Some(rx) => rx.recv().await,
-        None => std::future::pending().await,
-    }
 }
 
 /// Resolve a hint to a property grid; see the module docs for the order.
