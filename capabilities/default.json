@@ -1,7 +1,24 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Default capability for the inspector window and its in-target overlay window (the overlay page listens for overlay-draw and pulls get_overlay_state)",
-  "windows": ["main", "overlay"],
-  "permissions": ["core:default", "store:default"]
+  "description": "The inspector's main window: core + store plugins and every app command. The overlay window has its own, narrower capability (overlay.json).",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "store:default",
+    "allow-get-backend-name",
+    "allow-capture-desktop",
+    "allow-start-hover-mode",
+    "allow-stop-hover-mode",
+    "allow-start-focus-tracking",
+    "allow-stop-focus-tracking",
+    "allow-get-selector-for-ref",
+    "allow-get-property-grid",
+    "allow-save-collapse-state",
+    "allow-load-collapse-state",
+    "allow-show-overlay",
+    "allow-hide-overlay",
+    "allow-get-overlay-state",
+    "allow-show-selector-matches"
+  ]
 }

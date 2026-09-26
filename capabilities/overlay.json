@@ -1,0 +1,11 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "overlay",
+  "description": "The in-target overlay window: it only listens for overlay-draw and pulls get_overlay_state once on load. No store access, no other app command.",
+  "windows": ["overlay"],
+  "permissions": [
+    "core:event:allow-listen",
+    "core:event:allow-unlisten",
+    "allow-get-overlay-state"
+  ]
+}
