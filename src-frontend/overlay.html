@@ -34,7 +34,12 @@
       const { invoke } = window.__TAURI__.core;
       const { listen } = window.__TAURI__.event;
 
-      // draw = { kind, color, border, rects: [{x, y, width, height}] } | null
+      // The last draw received, in PHYSICAL pixels as the backend sent it, so
+      // it can be re-rendered when the CSS scale changes.
+      // draw = { seq, kind, color, border, rects: [{x, y, width, height}] } | null
+      let lastDraw = null;
+      let lastSeq = 0;
+
       function render(draw) {
         document.body.replaceChildren();
         if (!draw) return;
@@ -68,10 +73,47 @@
         };
       }
 
-      // Listen first, then pull the current state, so a draw emitted while
-      // this page was still loading is not lost.
-      listen("overlay-draw", (event) => render(toCss(event.payload)));
-      invoke("get_overlay_state").then((draw) => render(toCss(draw)));
+      function redraw() {
+        render(toCss(lastDraw));
+      }
+
+      // Accept a draw only if it is newer than what is shown: the pushed event
+      // and the get_overlay_state pull can arrive in either order.
+      function accept(draw) {
+        if (!draw) {
+          // The pull found nothing to draw; only meaningful before any draw.
+          if (lastSeq === 0) redraw();
+          return;
+        }
+        if (draw.seq <= lastSeq) return;
+        lastSeq = draw.seq;
+        lastDraw = draw;
+        redraw();
+      }
+
+      // Re-render when the window is resized or moved to a monitor with a
+      // different scale. A resolution media query only fires once, for the
+      // ratio it was built with, so re-arm it with the new ratio every time.
+      function watchPixelRatio() {
+        const mq = window.matchMedia(`(resolution: ${window.devicePixelRatio || 1}dppx)`);
+        mq.addEventListener(
+          "change",
+          () => {
+            redraw();
+            watchPixelRatio();
+          },
+          { once: true },
+        );
+      }
+      window.addEventListener("resize", redraw);
+      watchPixelRatio();
+
+      // Register the listener BEFORE pulling the current state, so a draw
+      // emitted while this page was still loading is not lost.
+      (async () => {
+        await listen("overlay-draw", (event) => accept(event.payload));
+        accept(await invoke("get_overlay_state"));
+      })();
     </script>
   </body>
 </html>

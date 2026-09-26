@@ -117,8 +117,13 @@ hideOverlayBtn.addEventListener("click", hideOverlay);
 
 let currentMode = "hover";
 let focusTracking = false;
+// Set while start_focus_tracking is in flight, so a second click or a mode
+// switch during the start does not race it.
+let focusStartPending = false;
 
 async function startFocusTracking() {
+  if (focusStartPending) return;
+  focusStartPending = true;
   try {
     await invoke("start_focus_tracking");
     focusTracking = true;
@@ -128,6 +133,12 @@ async function startFocusTracking() {
     focusTracking = false;
     focusToggleBtn.textContent = "Start focus tracking";
     statusEl.textContent = `focus tracking error: ${e}`;
+  } finally {
+    focusStartPending = false;
+  }
+  // The user left focus mode while the start was in flight: stop it again.
+  if (currentMode !== "focus") {
+    await stopFocusTracking();
   }
 }
 
@@ -155,7 +166,10 @@ function setMode(mode) {
   }
   if (mode === "focus") {
     startFocusTracking();
-  } else if (focusTracking) {
+  } else {
+    // Always stop when leaving focus mode — even when `focusTracking` is not
+    // (yet) true, a start may be in flight. The backend treats it as a no-op
+    // when nothing runs.
     stopFocusTracking();
   }
   if (mode === "selector") {
@@ -168,6 +182,7 @@ for (const radio of modeRadios) {
 }
 
 focusToggleBtn.addEventListener("click", () => {
+  if (focusStartPending) return;
   if (focusTracking) {
     stopFocusTracking().then(() => {
       statusEl.textContent = "focus tracking stopped";
@@ -230,8 +245,10 @@ function renderSelector(container, info) {
     ? "unique"
     : info.match_count === 0
       ? "no match"
-      : `ambiguous (${info.match_count} matches)`;
-  badge.title = `strategy: ${info.strategy}; ${info.match_count} match(es) in the cached snapshot`;
+      : `ambiguous (${info.match_count} matches on the captured desktop)`;
+  badge.title =
+    `strategy: ${info.strategy}; ${info.match_count} match(es) on the captured desktop ` +
+    "(upper bound for a narrower step target)";
   bar.appendChild(badge);
 
   const copyBtn = document.createElement("button");
@@ -263,6 +280,14 @@ function refFromInput() {
   return refInput.value.trim();
 }
 
+// Capture generation of the ref in the input box, when it was filled from a
+// shown element (null when typed by hand). Sent with every ref command so the
+// backend refuses a ref the tree has since renumbered ("stale ref — re-select").
+let refInputGeneration = null;
+refInput.addEventListener("input", () => {
+  refInputGeneration = null;
+});
+
 getSelectorBtn.addEventListener("click", async () => {
   const refId = refFromInput();
   matchesOutput.textContent = "";
@@ -271,11 +296,12 @@ getSelectorBtn.addEventListener("click", async () => {
     return;
   }
   try {
-    const info = await invoke("get_selector_for_ref", { refId });
+    const generation = refInputGeneration;
+    const info = await invoke("get_selector_for_ref", { refId, generation });
     renderSelector(selectorOutput, info);
     // Entering a ref selects that element (blue).
     try {
-      const grid = await invoke("get_property_grid", { refId });
+      const grid = await invoke("get_property_grid", { refId, generation });
       showGrid(grid, "selected");
     } catch (_) {
       // ignore — grid may not be loaded
@@ -286,16 +312,19 @@ getSelectorBtn.addEventListener("click", async () => {
 });
 
 showMatchesBtn.addEventListener("click", async () => {
-  const refId = refFromInput() || (shownGrid && shownGrid.ref_id);
+  const typed = refFromInput();
+  const refId = typed || (shownGrid && shownGrid.ref_id);
   if (!refId) {
     matchesOutput.textContent = "(enter a ref id or select an element)";
     return;
   }
+  const generation = typed ? refInputGeneration : shownGrid.generation;
   try {
-    const res = await invoke("show_selector_matches", { refId });
+    const res = await invoke("show_selector_matches", { refId, generation });
     renderSelector(selectorOutput, res.selector);
     const lines = [
-      `${res.match_refs.length} match(es): ${res.match_refs.join(", ")}`,
+      `${res.match_refs.length} match(es) on the captured desktop ` +
+        `(upper bound for a narrower step target): ${res.match_refs.join(", ")}`,
     ];
     if (res.overlay_error) {
       lines.push(`on-screen outline unavailable: ${res.overlay_error}`);
@@ -355,6 +384,7 @@ selectCurrentBtn.addEventListener("click", () => {
   if (shownGrid && shownGrid.ref_id) {
     showGrid(shownGrid, "selected");
     refInput.value = refLabel(shownGrid.ref_id);
+    refInputGeneration = shownGrid.generation;
     statusEl.textContent = `selected ${refLabel(shownGrid.ref_id)}`;
   }
 });

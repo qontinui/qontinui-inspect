@@ -38,6 +38,7 @@
 //! own window at absolute screen coordinates). The inspector's in-UI
 //! highlighting keeps working in both cases.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
@@ -153,6 +154,10 @@ pub fn overlay_geometry(bounds: &[UnifiedBounds], border: i32) -> Option<Overlay
 /// Payload of [`OVERLAY_DRAW_EVENT`], and what `get_overlay_state` returns.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OverlayDraw {
+    /// Monotonic per process (starts at 1). The page ignores any draw whose
+    /// `seq` is not newer than the last one it rendered, so an event and the
+    /// `get_overlay_state` pull can arrive in either order.
+    pub seq: u64,
     pub kind: OverlayKind,
     pub color: String,
     pub border: i32,
@@ -213,9 +218,15 @@ pub fn overlay_support() -> Result<(), String> {
 #[derive(Default)]
 pub struct OverlayState {
     last: Mutex<Option<OverlayDraw>>,
+    seq: AtomicU64,
 }
 
 impl OverlayState {
+    /// The next draw sequence number (1, 2, …).
+    pub fn next_seq(&self) -> u64 {
+        self.seq.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
     pub fn last(&self) -> Option<OverlayDraw> {
         self.last.lock().ok().and_then(|g| g.clone())
     }
@@ -267,6 +278,7 @@ pub fn show(
     let geometry = overlay_geometry(bounds, BORDER_PX)
         .ok_or_else(|| "overlay: no element bounds to draw (all empty or missing)".to_string())?;
     let draw = OverlayDraw {
+        seq: state.next_seq(),
         kind,
         color: kind.color().to_string(),
         border: BORDER_PX,
@@ -356,6 +368,14 @@ mod tests {
         let g = overlay_geometry(&[bounds(0, 0, 0, 10), bounds(10, 10, 4, 4)], 0).unwrap();
         assert_eq!(g.rects.len(), 1);
         assert_eq!((g.x, g.y, g.width, g.height), (10, 10, 4, 4));
+    }
+
+    #[test]
+    fn draw_sequence_is_monotonic_from_one() {
+        let state = OverlayState::default();
+        assert_eq!(state.next_seq(), 1);
+        assert_eq!(state.next_seq(), 2);
+        assert_eq!(state.next_seq(), 3);
     }
 
     #[test]

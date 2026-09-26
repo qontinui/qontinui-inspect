@@ -6,7 +6,7 @@
 
 use std::collections::HashSet;
 
-use qontinui_runner_lib::accessibility::model::{UnifiedBounds, UnifiedNode};
+use qontinui_runner_lib::accessibility::model::{UnifiedBounds, UnifiedNode, UnifiedRole};
 
 /// Title of the inspector's own in-target overlay window (see `overlay.rs`).
 ///
@@ -17,11 +17,74 @@ use qontinui_runner_lib::accessibility::model::{UnifiedBounds, UnifiedNode};
 /// the subtree rooted at a node carrying this name.
 pub const OVERLAY_WINDOW_TITLE: &str = "Qontinui Inspector Overlay";
 
+/// Identity of an element that survives a re-capture.
+///
+/// Session refs (`@e3`) cannot serve: the ref manager renumbers them on every
+/// capture, so the same element carries a different ref after the focus task
+/// or hover loop re-captures. `platform_handle` cannot either — it indexes the
+/// adapter's handle table, which hands out fresh handles per capture. What is
+/// stable for an element that has not moved is its role, automation id, class
+/// name and screen bounds, so that tuple is the identity used to decide
+/// whether a focus / hover report is about the element already shown.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NodeIdentity {
+    pub role: UnifiedRole,
+    pub automation_id: Option<String>,
+    pub class_name: Option<String>,
+    /// `(x, y, width, height)`.
+    pub bounds: Option<(i32, i32, i32, i32)>,
+}
+
+impl NodeIdentity {
+    pub fn of(node: &UnifiedNode) -> Self {
+        Self {
+            role: node.role,
+            automation_id: node.automation_id.clone(),
+            class_name: node.class_name.clone(),
+            bounds: node.bounds.as_ref().map(|b| (b.x, b.y, b.width, b.height)),
+        }
+    }
+}
+
+/// Whether a report about `next` should be emitted, given the identity of the
+/// last one emitted. `None` for `next` means the report could not be tied to a
+/// node (an unresolved focus event); those are always emitted, since there is
+/// nothing to compare.
+pub fn is_new_identity(last: Option<&NodeIdentity>, next: Option<&NodeIdentity>) -> bool {
+    match next {
+        None => true,
+        Some(next) => last != Some(next),
+    }
+}
+
 /// Canonical ref form. The runner's ref manager assigns refs WITH the sigil
 /// (`"@e3"`), but users type and paste them either way, so every lookup and
 /// every displayed ref goes through here: trimmed, exactly one leading `@`.
 pub fn normalize_ref(ref_id: &str) -> String {
     format!("@{}", ref_id.trim().trim_start_matches('@'))
+}
+
+/// Refuse a ref that came from a capture other than the current one.
+///
+/// `requested` is the generation the caller read the ref from (`None` for a
+/// ref typed by hand, which is taken against the current capture as-is).
+/// Because the ref manager renumbers refs per capture, resolving an old ref
+/// against a new tree would silently target a different element.
+pub fn check_ref_generation(
+    ref_id: &str,
+    requested: Option<u64>,
+    current: u64,
+) -> Result<(), String> {
+    match requested {
+        Some(g) if g != current => Err(format!(
+            "stale ref — re-select: {} is from capture generation {}, but the tree has since \
+             been re-captured (generation {}) and refs were renumbered",
+            normalize_ref(ref_id),
+            g,
+            current
+        )),
+        _ => Ok(()),
+    }
 }
 
 /// Whether `node` is the inspector's overlay window.
@@ -240,6 +303,58 @@ mod tests {
         t.children.push(dup);
         assert!(find_unique_by_name(&t, "Save").is_none());
         assert!(find_unique_by_name(&t, "Missing").is_none());
+    }
+
+    #[test]
+    fn ref_from_an_older_generation_is_refused() {
+        assert!(check_ref_generation("@e3", Some(7), 7).is_ok());
+        assert!(check_ref_generation("e3", None, 7).is_ok());
+        let err = check_ref_generation("e3", Some(6), 7).unwrap_err();
+        assert!(err.starts_with("stale ref — re-select"), "{err}");
+        assert!(
+            err.contains("@e3") && err.contains("generation 6") && err.contains("generation 7")
+        );
+    }
+
+    #[test]
+    fn identity_survives_ref_renumbering() {
+        let t = tree();
+        let mut recaptured = t.children[1].clone();
+        recaptured.ref_id = "e42".into(); // a later capture renumbered it
+        assert_eq!(
+            NodeIdentity::of(&t.children[1]),
+            NodeIdentity::of(&recaptured)
+        );
+        let last = NodeIdentity::of(&t.children[1]);
+        assert!(!is_new_identity(
+            Some(&last),
+            Some(&NodeIdentity::of(&recaptured))
+        ));
+    }
+
+    #[test]
+    fn identity_changes_when_the_element_differs() {
+        let t = tree();
+        let save = NodeIdentity::of(&t.children[1]);
+        let edit = NodeIdentity::of(&t.children[2]);
+        assert!(is_new_identity(Some(&save), Some(&edit)));
+        assert!(is_new_identity(None, Some(&save)));
+
+        // Same role/id/class, moved: a different element as far as display goes.
+        let mut moved = t.children[1].clone();
+        moved.bounds = Some(bounds(10, 400, 100, 30));
+        assert!(is_new_identity(
+            Some(&save),
+            Some(&NodeIdentity::of(&moved))
+        ));
+    }
+
+    #[test]
+    fn unresolved_reports_are_always_new() {
+        let t = tree();
+        let save = NodeIdentity::of(&t.children[1]);
+        assert!(is_new_identity(Some(&save), None));
+        assert!(is_new_identity(None, None));
     }
 
     #[test]

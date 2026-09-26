@@ -20,24 +20,44 @@
 //!
 //! `FocusChanged { ref_id, node_name }` rarely carries a usable ref: the UIA
 //! handler sends an empty `ref_id` plus the element's name, and the AT-SPI
-//! adapter sends the D-Bus object path, which is not a ref-manager ref. So:
+//! adapter sends the D-Bus object path, which is not a ref-manager ref. So,
+//! first against the CURRENT cached snapshot, with no capture:
 //!
 //! 1. a `ref_id` that resolves in the cached snapshot wins;
-//! 2. otherwise the tree is re-captured and the deepest node whose
-//!    `state.is_focused` is set is taken;
-//! 3. failing that, the one node whose name equals the event's `node_name`
-//!    (only when exactly one does — a guess between duplicates is wrong);
-//! 4. failing that, `element-focused` is still emitted, built from what the
+//! 2. otherwise the one cached node whose name equals the event's `node_name`
+//!    (only when exactly one does — a guess between duplicates is wrong).
+//!
+//! The cached `state.is_focused` flags are NOT consulted: they describe focus
+//! at capture time, which is exactly what just changed. Only when the cache
+//! cannot answer is the desktop re-captured, and then:
+//!
+//! 3. the deepest node whose `state.is_focused` is set is taken;
+//! 4. failing that, the unique-name match against the fresh tree;
+//! 5. failing that, `element-focused` is still emitted, built from what the
 //!    event carries, with `ref_id` empty and `note` saying it is unresolved.
 //!
-//! Bursts of focus events (a dialog opening moves focus several times) are
-//! debounced by [`DEBOUNCE`] so one re-capture serves the whole burst.
+//! A re-capture walks the whole desktop under the manager lock, so they are
+//! rate-limited to one per [`MIN_RECAPTURE_INTERVAL`]: a hint that needs one
+//! sooner is kept and retried when the interval has passed (a newer hint
+//! replaces it meanwhile). Bursts of focus events (a dialog opening moves
+//! focus several times) are also debounced by [`DEBOUNCE`].
+//!
+//! # Deduplication
+//!
+//! Refs are renumbered on every capture, so "same element as last time" is
+//! decided on [`NodeIdentity`] (role, automation id, class name, bounds), not
+//! on the ref — otherwise every re-capture would re-emit the same element.
+//!
+//! `has_native_events()` is re-read at most every [`NATIVE_EVENTS_RECHECK`],
+//! and immediately after a `ConnectionChanged` event, rather than locking the
+//! manager on every poll tick.
 
 use std::time::Duration;
 
 use tauri::{Emitter, Manager};
 use tokio::sync::{broadcast, oneshot};
 use tokio::task::JoinHandle;
+use tokio::time::Instant;
 use tracing::{debug, info, warn};
 
 use qontinui_runner_lib::accessibility::{
@@ -46,7 +66,9 @@ use qontinui_runner_lib::accessibility::{
     traits::ConnectionTarget,
 };
 
-use crate::tree::{find_focused, find_unique_by_name, normalize_ref};
+use crate::tree::{
+    find_focused, find_unique_by_name, is_new_identity, normalize_ref, NodeIdentity,
+};
 use crate::{InspectorState, PropertyGrid};
 
 /// Tauri event emitted on each resolved focus change. Payload: `PropertyGrid`,
@@ -58,6 +80,12 @@ pub const DEBOUNCE: Duration = Duration::from_millis(150);
 
 /// Re-capture period when the connected adapter offers no event stream.
 pub const POLL_INTERVAL: Duration = Duration::from_millis(1000);
+
+/// Minimum spacing between desktop re-captures made by the focus task.
+pub const MIN_RECAPTURE_INTERVAL: Duration = Duration::from_millis(1000);
+
+/// How long a `has_native_events()` reading is trusted before it is re-read.
+pub const NATIVE_EVENTS_RECHECK: Duration = Duration::from_secs(5);
 
 /// A running focus-tracking task and its stop signal.
 pub struct FocusTask {
@@ -137,6 +165,40 @@ async fn should_poll(app: &tauri::AppHandle) -> bool {
     mgr.is_connected() && !mgr.has_native_events()
 }
 
+/// How long to wait before a re-capture is allowed, or `None` when one may run
+/// now. Pure so the rate limit is testable.
+pub fn recapture_wait(
+    last_capture: Option<Instant>,
+    now: Instant,
+    min_interval: Duration,
+) -> Option<Duration> {
+    let elapsed = now.saturating_duration_since(last_capture?);
+    min_interval.checked_sub(elapsed).filter(|d| !d.is_zero())
+}
+
+/// A resolved focus report: the grid to emit and, when it was read from a
+/// node, that node's identity for deduplication.
+struct Resolved {
+    grid: PropertyGrid,
+    identity: Option<NodeIdentity>,
+}
+
+impl Resolved {
+    fn from_node(node: &UnifiedNode, root: &UnifiedNode, generation: u64) -> Self {
+        Self {
+            grid: PropertyGrid::from_node(node, root, generation),
+            identity: Some(NodeIdentity::of(node)),
+        }
+    }
+
+    fn unresolved(event_ref: &str, node_name: Option<&str>, why: &str) -> Self {
+        Self {
+            grid: unresolved_grid(event_ref, node_name, why),
+            identity: None,
+        }
+    }
+}
+
 async fn run(
     app: tauri::AppHandle,
     mut bus: broadcast::Receiver<A11yEvent>,
@@ -146,8 +208,11 @@ async fn run(
     let mut poll = tokio::time::interval(POLL_INTERVAL);
     poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut pending: Option<FocusHint> = None;
-    let mut deadline = tokio::time::Instant::now();
-    let mut last_ref: Option<String> = None;
+    let mut deadline = Instant::now();
+    let mut last_identity: Option<NodeIdentity> = None;
+    let mut last_capture: Option<Instant> = None;
+    // (should poll, when read) — see NATIVE_EVENTS_RECHECK.
+    let mut poll_mode: Option<(bool, Instant)> = None;
 
     loop {
         tokio::select! {
@@ -156,7 +221,11 @@ async fn run(
             ev = bus.recv(), if bus_open => match ev {
                 Ok(A11yEvent::FocusChanged { ref_id, node_name }) => {
                     pending = Some(FocusHint::Event { ref_id, node_name });
-                    deadline = tokio::time::Instant::now() + DEBOUNCE;
+                    deadline = Instant::now() + DEBOUNCE;
+                }
+                Ok(A11yEvent::ConnectionChanged { .. }) => {
+                    // The adapter (and whether it streams) may have changed.
+                    poll_mode = None;
                 }
                 Ok(_) => {}
                 Err(broadcast::error::RecvError::Lagged(n)) => {
@@ -169,22 +238,37 @@ async fn run(
             },
 
             _ = poll.tick(), if pending.is_none() => {
-                if should_poll(&app).await {
+                let now = Instant::now();
+                let stale = poll_mode
+                    .is_none_or(|(_, at)| now.saturating_duration_since(at) >= NATIVE_EVENTS_RECHECK);
+                if stale {
+                    poll_mode = Some((should_poll(&app).await, now));
+                }
+                if poll_mode.is_some_and(|(should, _)| should) {
                     pending = Some(FocusHint::Poll);
-                    deadline = tokio::time::Instant::now();
+                    deadline = now;
                 }
             }
 
             _ = tokio::time::sleep_until(deadline), if pending.is_some() => {
-                if let Some(hint) = pending.take() {
-                    if let Some(grid) = resolve(&app, &hint).await {
-                        let same = !grid.ref_id.is_empty()
-                            && last_ref.as_deref() == Some(grid.ref_id.as_str());
-                        if !same {
-                            last_ref = Some(grid.ref_id.clone());
-                            if let Err(e) = app.emit(ELEMENT_FOCUSED_EVENT, &grid) {
-                                warn!("emit {} failed: {}", ELEMENT_FOCUSED_EVENT, e);
-                            }
+                let Some(hint) = pending.take() else { continue };
+                let mut resolved = resolve_cached(&app, &hint).await;
+                if resolved.is_none() {
+                    let now = Instant::now();
+                    if let Some(wait) = recapture_wait(last_capture, now, MIN_RECAPTURE_INTERVAL) {
+                        // Rate-limited: keep the hint, retry once allowed.
+                        pending = Some(hint);
+                        deadline = now + wait;
+                        continue;
+                    }
+                    last_capture = Some(now);
+                    resolved = resolve_by_capture(&app, &hint).await;
+                }
+                if let Some(r) = resolved {
+                    if is_new_identity(last_identity.as_ref(), r.identity.as_ref()) {
+                        last_identity = r.identity;
+                        if let Err(e) = app.emit(ELEMENT_FOCUSED_EVENT, &r.grid) {
+                            warn!("emit {} failed: {}", ELEMENT_FOCUSED_EVENT, e);
                         }
                     }
                 }
@@ -195,27 +279,46 @@ async fn run(
     info!("focus tracking stopped");
 }
 
-/// Resolve a hint to a property grid; see the module docs for the order.
-async fn resolve(app: &tauri::AppHandle, hint: &FocusHint) -> Option<PropertyGrid> {
-    let state = app.try_state::<InspectorState>()?;
-    let mut mgr = state.manager.lock().await;
-
-    if let FocusHint::Event { ref_id, .. } = hint {
-        if !ref_id.trim().trim_start_matches('@').is_empty() {
-            if let Some(snap) = mgr.snapshot().await {
-                if let Some(node) = snap.root.find_by_ref(&normalize_ref(ref_id)) {
-                    return Some(PropertyGrid::from_node(node, &snap.root));
-                }
-            }
+/// Resolve an event hint against `root` alone (steps 1-2 of the module docs).
+/// Pure so the cache-first order is testable.
+pub fn resolve_in_snapshot<'a>(
+    ref_id: &str,
+    node_name: Option<&str>,
+    root: &'a UnifiedNode,
+) -> Option<&'a UnifiedNode> {
+    if !ref_id.trim().trim_start_matches('@').is_empty() {
+        if let Some(node) = root.find_by_ref(&normalize_ref(ref_id)) {
+            return Some(node);
         }
     }
+    node_name.and_then(|name| find_unique_by_name(root, name))
+}
+
+/// Steps 1-2: resolve from the cached snapshot, no capture. `None` for a poll
+/// hint (polling exists to see changes the cache cannot show) or when the
+/// cache cannot answer.
+async fn resolve_cached(app: &tauri::AppHandle, hint: &FocusHint) -> Option<Resolved> {
+    let FocusHint::Event { ref_id, node_name } = hint else {
+        return None;
+    };
+    let state = app.try_state::<InspectorState>()?;
+    let mgr = state.manager.lock().await;
+    let snap = mgr.snapshot().await?;
+    resolve_in_snapshot(ref_id, node_name.as_deref(), &snap.root)
+        .map(|node| Resolved::from_node(node, &snap.root, snap.generation))
+}
+
+/// Steps 3-5: re-capture and resolve against the fresh tree.
+async fn resolve_by_capture(app: &tauri::AppHandle, hint: &FocusHint) -> Option<Resolved> {
+    let state = app.try_state::<InspectorState>()?;
+    let mut mgr = state.manager.lock().await;
 
     let snap = match mgr.capture(None, false).await {
         Ok(s) => s,
         Err(e) => {
             warn!("focus: re-capture failed: {}", e);
             return match hint {
-                FocusHint::Event { ref_id, node_name } => Some(unresolved_grid(
+                FocusHint::Event { ref_id, node_name } => Some(Resolved::unresolved(
                     ref_id,
                     node_name.as_deref(),
                     "re-capture failed",
@@ -225,16 +328,16 @@ async fn resolve(app: &tauri::AppHandle, hint: &FocusHint) -> Option<PropertyGri
         }
     };
     if let Some(node) = find_focused(&snap.root) {
-        return Some(PropertyGrid::from_node(node, &snap.root));
+        return Some(Resolved::from_node(node, &snap.root, snap.generation));
     }
     match hint {
         FocusHint::Event { ref_id, node_name } => {
             if let Some(name) = node_name.as_deref() {
                 if let Some(node) = find_unique_by_name(&snap.root, name) {
-                    return Some(PropertyGrid::from_node(node, &snap.root));
+                    return Some(Resolved::from_node(node, &snap.root, snap.generation));
                 }
             }
-            Some(unresolved_grid(
+            Some(Resolved::unresolved(
                 ref_id,
                 node_name.as_deref(),
                 "focused element not found in a fresh capture",
@@ -269,7 +372,7 @@ fn unresolved_grid(event_ref: &str, node_name: Option<&str>, why: &str) -> Prope
         supported_patterns: vec![],
         generation: 0,
     };
-    let mut grid = PropertyGrid::from_node(&node, &node);
+    let mut grid = PropertyGrid::from_node(&node, &node, 0);
     // A selector for a node that is not in the tree would be computed against
     // nothing and report itself as trivially unique — omit it instead.
     grid.selector = None;
@@ -279,4 +382,65 @@ fn unresolved_grid(event_ref: &str, node_name: Option<&str>, why: &str) -> Prope
         format!("unresolved focus event (source id {}): {}", event_ref, why)
     });
     grid
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tree::test_support::node;
+
+    fn tree() -> UnifiedNode {
+        let mut root = node("@e1", UnifiedRole::Window);
+        let mut save = node("@e2", UnifiedRole::Button);
+        save.name = Some("Save".into());
+        let mut ok_a = node("@e3", UnifiedRole::Button);
+        ok_a.name = Some("OK".into());
+        let mut ok_b = node("@e4", UnifiedRole::Button);
+        ok_b.name = Some("OK".into());
+        root.children = vec![save, ok_a, ok_b];
+        root
+    }
+
+    #[test]
+    fn cached_resolution_prefers_a_resolvable_ref() {
+        let t = tree();
+        let hit = resolve_in_snapshot("e3", Some("Save"), &t).unwrap();
+        assert_eq!(hit.ref_id, "@e3");
+    }
+
+    #[test]
+    fn cached_resolution_falls_back_to_a_unique_name() {
+        let t = tree();
+        // AT-SPI object path: not a ref.
+        let hit = resolve_in_snapshot("/org/a11y/atspi/accessible/42", Some("Save"), &t).unwrap();
+        assert_eq!(hit.ref_id, "@e2");
+        assert_eq!(
+            resolve_in_snapshot("", Some("Save"), &t).unwrap().ref_id,
+            "@e2"
+        );
+    }
+
+    #[test]
+    fn cached_resolution_refuses_duplicate_or_missing_names() {
+        let t = tree();
+        assert!(resolve_in_snapshot("", Some("OK"), &t).is_none());
+        assert!(resolve_in_snapshot("", Some("Missing"), &t).is_none());
+        assert!(resolve_in_snapshot("", None, &t).is_none());
+    }
+
+    #[test]
+    fn recapture_is_rate_limited() {
+        let t0 = Instant::now();
+        let min = Duration::from_millis(1000);
+        assert_eq!(recapture_wait(None, t0, min), None);
+        assert_eq!(
+            recapture_wait(Some(t0), t0 + Duration::from_millis(300), min),
+            Some(Duration::from_millis(700))
+        );
+        assert_eq!(recapture_wait(Some(t0), t0 + min, min), None);
+        assert_eq!(
+            recapture_wait(Some(t0), t0 + Duration::from_secs(5), min),
+            None
+        );
+    }
 }

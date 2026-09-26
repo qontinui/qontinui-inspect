@@ -58,7 +58,7 @@ use qontinui_runner_lib::accessibility::{
 
 use crate::overlay::{OverlayDraw, OverlayKind, OverlayState};
 use crate::selector::SelectorInfo;
-use crate::tree::find_deepest_at;
+use crate::tree::{find_deepest_at, is_new_identity, NodeIdentity};
 
 // -----------------------------------------------------------------------------
 // Shared state
@@ -121,6 +121,12 @@ pub struct PropertyGrid {
     pub bounds: Option<UnifiedBounds>,
     pub state: UnifiedState,
     pub is_interactive: bool,
+    /// Capture generation of the snapshot the node was read from. Refs are
+    /// renumbered by every capture, so ref-based commands take this back and
+    /// refuse a ref from an older generation ("stale ref — re-select") rather
+    /// than silently resolving it to whatever node now carries that ref.
+    /// `0` for an unresolved focus grid, which has no ref.
+    pub generation: u64,
     /// Show Selector result — the same value `get_selector_for_ref` returns.
     /// `None` only for a focus event that could not be resolved to a node.
     pub selector: Option<SelectorInfo>,
@@ -132,8 +138,8 @@ pub struct PropertyGrid {
 
 impl PropertyGrid {
     /// Build the grid for `node`, computing its selector against `root` (the
-    /// snapshot root the node was found in).
-    pub fn from_node(node: &UnifiedNode, root: &UnifiedNode) -> Self {
+    /// root of the snapshot, of capture `generation`, the node was found in).
+    pub fn from_node(node: &UnifiedNode, root: &UnifiedNode, generation: u64) -> Self {
         Self {
             ref_id: node.ref_id.clone(),
             role: node.role.as_str().to_string(),
@@ -145,6 +151,7 @@ impl PropertyGrid {
             bounds: node.bounds.clone(),
             state: node.state.clone(),
             is_interactive: node.is_interactive,
+            generation,
             selector: Some(selector::selector_for(node, root)),
             note: None,
         }
@@ -268,23 +275,30 @@ async fn stop_focus_tracking(state: tauri::State<'_, InspectorState>) -> Result<
 }
 
 /// Find `ref_id` (with or without its leading `@` — see `tree::normalize_ref`;
-/// the ref manager's refs carry it) in the cached snapshot and
-/// hand it, with the snapshot root, to `f`.
+/// the ref manager's refs carry it) in the cached snapshot and hand it, with
+/// the snapshot root and generation, to `f`.
+///
+/// `generation` is the capture generation the caller got the ref from (a
+/// `PropertyGrid`'s `generation`). When given, a ref from any other generation
+/// is refused — see `tree::check_ref_generation`. A ref typed by hand has no
+/// generation and is resolved against the current snapshot.
 async fn with_cached_node<T>(
     state: &InspectorState,
     ref_id: &str,
-    f: impl FnOnce(&UnifiedNode, &UnifiedNode) -> T,
+    generation: Option<u64>,
+    f: impl FnOnce(&UnifiedNode, &UnifiedNode, u64) -> T,
 ) -> Result<T, String> {
     let mgr = state.manager.lock().await;
     let snap = mgr
         .snapshot()
         .await
         .ok_or_else(|| "no tree captured yet — call capture_desktop first".to_string())?;
+    tree::check_ref_generation(ref_id, generation, snap.generation)?;
     let node = snap
         .root
         .find_by_ref(&tree::normalize_ref(ref_id))
         .ok_or_else(|| format!("ref not found: {}", ref_id))?;
-    Ok(f(node, &snap.root))
+    Ok(f(node, &snap.root, snap.generation))
 }
 
 /// Show Selector: the `native_accessibility` `query` step fragment that
@@ -295,18 +309,23 @@ async fn with_cached_node<T>(
 #[tauri::command]
 async fn get_selector_for_ref(
     ref_id: String,
+    generation: Option<u64>,
     state: tauri::State<'_, InspectorState>,
 ) -> Result<SelectorInfo, String> {
-    with_cached_node(&state, &ref_id, selector::selector_for).await
+    with_cached_node(&state, &ref_id, generation, |node, root, _| {
+        selector::selector_for(node, root)
+    })
+    .await
 }
 
 /// Return a property-grid snapshot for the node identified by `ref_id`.
 #[tauri::command]
 async fn get_property_grid(
     ref_id: String,
+    generation: Option<u64>,
     state: tauri::State<'_, InspectorState>,
 ) -> Result<PropertyGrid, String> {
-    with_cached_node(&state, &ref_id, PropertyGrid::from_node).await
+    with_cached_node(&state, &ref_id, generation, PropertyGrid::from_node).await
 }
 
 // -----------------------------------------------------------------------------
@@ -362,10 +381,11 @@ struct SelectorMatches {
 #[tauri::command]
 async fn show_selector_matches(
     ref_id: String,
+    generation: Option<u64>,
     app: tauri::AppHandle,
     state: tauri::State<'_, InspectorState>,
 ) -> Result<SelectorMatches, String> {
-    let (info, refs, rects) = with_cached_node(&state, &ref_id, |node, root| {
+    let (info, refs, rects) = with_cached_node(&state, &ref_id, generation, |node, root, _| {
         let info = selector::selector_for(node, root);
         let hits = selector::find_matches(&info.step, root).unwrap_or_default();
         let refs = hits
@@ -437,7 +457,9 @@ async fn windows_hover_loop(
     use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_CONTROL};
     use windows::Win32::UI::WindowsAndMessaging::GetCursorPos;
 
-    let mut last_ref: Option<String> = None;
+    // Identity, not ref: the periodic re-capture below renumbers refs, and a
+    // ref comparison would re-emit the element under the cursor every time.
+    let mut last_identity: Option<NodeIdentity> = None;
     let mut ticks_since_capture: u32 = 0;
 
     while hover_active.load(Ordering::Relaxed) {
@@ -465,23 +487,29 @@ async fn windows_hover_loop(
             }
         }
 
-        // Walk the cached tree.
+        // Hit-test the cached tree first; build the grid — whose selector is
+        // a whole-tree query — only when the element under the cursor changed.
         let grid_opt = if let Some(state) = app.try_state::<InspectorState>() {
             let mgr = state.manager.lock().await;
-            let snap = mgr.snapshot().await;
-            snap.and_then(|s| {
-                find_deepest_at(&s.root, pt.x, pt.y).map(|n| PropertyGrid::from_node(n, &s.root))
-            })
+            match mgr.snapshot().await {
+                Some(s) => find_deepest_at(&s.root, pt.x, pt.y).and_then(|n| {
+                    let identity = NodeIdentity::of(n);
+                    if is_new_identity(last_identity.as_ref(), Some(&identity)) {
+                        last_identity = Some(identity);
+                        Some(PropertyGrid::from_node(n, &s.root, s.generation))
+                    } else {
+                        None
+                    }
+                }),
+                None => None,
+            }
         } else {
             None
         };
 
         if let Some(grid) = grid_opt {
-            if last_ref.as_deref() != Some(grid.ref_id.as_str()) {
-                last_ref = Some(grid.ref_id.clone());
-                if let Err(e) = app.emit("element-hovered", &grid) {
-                    warn!("emit element-hovered failed: {}", e);
-                }
+            if let Err(e) = app.emit("element-hovered", &grid) {
+                warn!("emit element-hovered failed: {}", e);
             }
         }
     }
