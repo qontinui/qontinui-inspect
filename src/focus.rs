@@ -58,6 +58,13 @@
 //! changes swallowed — so the focus check comes first, and the geometry only
 //! narrows it.
 //!
+//! "Focused" is sampled when the focus change ARRIVES (for a poll, when the
+//! poll tick fires) and carried in the [`FocusHint`], not read when the hint
+//! is resolved: resolution runs after the debounce, and possibly after a
+//! rate-limit deferral and a desktop re-capture, by which time the user may
+//! have clicked into (or out of) the inspector. Reading focus then would
+//! judge an earlier focus change by a later window state.
+//!
 //! # Deduplication
 //!
 //! Refs are renumbered on every capture, so "same element as last time" is
@@ -128,14 +135,30 @@ impl FocusTask {
     }
 }
 
-/// What prompted a resolution.
+/// What prompted a resolution, with whether the inspector's main window was
+/// focused when it did (see "The inspector's own window" in the module docs).
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum FocusHint {
     Event {
         ref_id: String,
         node_name: Option<String>,
+        inspector_focused: bool,
     },
-    Poll,
+    Poll {
+        inspector_focused: bool,
+    },
+}
+
+impl FocusHint {
+    /// Whether the inspector's main window was focused when this hint arose.
+    fn inspector_focused(&self) -> bool {
+        match self {
+            Self::Event {
+                inspector_focused, ..
+            }
+            | Self::Poll { inspector_focused } => *inspector_focused,
+        }
+    }
 }
 
 /// Start the focus task. The caller must have stopped any previous one.
@@ -243,12 +266,26 @@ fn main_window_focused(app: &tauri::AppHandle) -> bool {
 }
 
 /// Whether a resolved report is about an element of the inspector's own main
-/// window (see the module docs).
-fn is_inspector_own(app: &tauri::AppHandle, resolved: &Resolved) -> bool {
-    let focused = main_window_focused(app);
+/// window (see the module docs). Focus is the hint's, sampled when it arose;
+/// only the window geometry is read now.
+fn is_inspector_own(app: &tauri::AppHandle, hint: &FocusHint, resolved: &Resolved) -> bool {
     // Only look the geometry up when it can matter.
-    let window = if focused { main_window_rect(app) } else { None };
-    drop_as_own_window(focused, resolved.grid.bounds.as_ref(), window)
+    let window = if hint.inspector_focused() {
+        main_window_rect(app)
+    } else {
+        None
+    };
+    drop_hint_as_own_window(hint, resolved.grid.bounds.as_ref(), window)
+}
+
+/// [`drop_as_own_window`] with the focus sampled into `hint`. Pure, so it is
+/// tested without a window.
+fn drop_hint_as_own_window(
+    hint: &FocusHint,
+    bounds: Option<&UnifiedBounds>,
+    window: Option<WindowRect>,
+) -> bool {
+    drop_as_own_window(hint.inspector_focused(), bounds, window)
 }
 
 /// Whether a focus report is dropped as the inspector's own: only while the
@@ -323,7 +360,11 @@ async fn run(
             ev = bus.recv(), if bus_open => match ev {
                 Ok(A11yEvent::FocusChanged { ref_id, node_name }) => {
                     focus_event_seen = true;
-                    pending = Some(FocusHint::Event { ref_id, node_name });
+                    pending = Some(FocusHint::Event {
+                        ref_id,
+                        node_name,
+                        inspector_focused: main_window_focused(&app),
+                    });
                     deadline = Instant::now() + DEBOUNCE;
                 }
                 Ok(A11yEvent::ConnectionChanged { .. }) => {
@@ -353,7 +394,9 @@ async fn run(
                 if source.is_some_and(|(connected, native, _)| {
                     poll_needed(connected, native, focus_event_seen)
                 }) {
-                    pending = Some(FocusHint::Poll);
+                    pending = Some(FocusHint::Poll {
+                        inspector_focused: main_window_focused(&app),
+                    });
                     deadline = now;
                 }
             }
@@ -379,7 +422,7 @@ async fn run(
                     }
                 };
                 if let Some(r) = resolved {
-                    if is_inspector_own(&app, &r) {
+                    if is_inspector_own(&app, &hint, &r) {
                         debug!("focus: ignoring focus inside the inspector's own window");
                         continue;
                     }
@@ -430,7 +473,10 @@ pub fn resolve_in_snapshot<'a>(
 /// poll hint (polling exists to see changes the cache cannot show), for a
 /// name-only hint, or when the cache cannot answer.
 async fn resolve_cached(app: &tauri::AppHandle, hint: &FocusHint) -> Option<Resolved> {
-    let FocusHint::Event { ref_id, node_name } = hint else {
+    let FocusHint::Event {
+        ref_id, node_name, ..
+    } = hint
+    else {
         return None;
     };
     let state = app.try_state::<InspectorState>()?;
@@ -452,12 +498,14 @@ async fn resolve_by_capture(app: &tauri::AppHandle, hint: &FocusHint) -> Option<
         Err(e) => {
             warn!("focus: re-capture failed: {}", e);
             return match hint {
-                FocusHint::Event { ref_id, node_name } => Some(Resolved::unresolved(
+                FocusHint::Event {
+                    ref_id, node_name, ..
+                } => Some(Resolved::unresolved(
                     ref_id,
                     node_name.as_deref(),
                     "re-capture failed",
                 )),
-                FocusHint::Poll => None,
+                FocusHint::Poll { .. } => None,
             };
         }
     };
@@ -465,7 +513,9 @@ async fn resolve_by_capture(app: &tauri::AppHandle, hint: &FocusHint) -> Option<
         return Some(Resolved::from_node(node, &snap.root, snap.generation));
     }
     match hint {
-        FocusHint::Event { ref_id, node_name } => {
+        FocusHint::Event {
+            ref_id, node_name, ..
+        } => {
             if let Some(name) = node_name.as_deref() {
                 if let Some(node) = find_unique_by_name(&snap.root, name) {
                     return Some(Resolved::from_node(node, &snap.root, snap.generation));
@@ -477,7 +527,7 @@ async fn resolve_by_capture(app: &tauri::AppHandle, hint: &FocusHint) -> Option<
                 "focused element not found in a fresh capture",
             ))
         }
-        FocusHint::Poll => None,
+        FocusHint::Poll { .. } => None,
     }
 }
 
@@ -654,5 +704,42 @@ mod tests {
         assert!(!drop_as_own_window(true, Some(&outside), Some(win)));
         assert!(!drop_as_own_window(true, None, Some(win)));
         assert!(!drop_as_own_window(true, Some(&inside), None));
+    }
+
+    #[test]
+    fn own_window_drop_uses_the_focus_sampled_when_the_hint_arose() {
+        let win: WindowRect = (100, 100, 800, 600);
+        let inside = bounds(150, 150, 100, 30);
+        let event = |inspector_focused| FocusHint::Event {
+            ref_id: "@e1".to_string(),
+            node_name: None,
+            inspector_focused,
+        };
+        // Focus arrived in another app while the inspector was NOT focused;
+        // the user clicking into the inspector before resolution (which is
+        // not an input here) must not swallow it.
+        assert!(!drop_hint_as_own_window(
+            &event(false),
+            Some(&inside),
+            Some(win)
+        ));
+        // Focus arrived while the inspector WAS focused: its own element.
+        assert!(drop_hint_as_own_window(
+            &event(true),
+            Some(&inside),
+            Some(win)
+        ));
+        // Poll hints carry their poll-time sample the same way.
+        let poll = |inspector_focused| FocusHint::Poll { inspector_focused };
+        assert!(!drop_hint_as_own_window(
+            &poll(false),
+            Some(&inside),
+            Some(win)
+        ));
+        assert!(drop_hint_as_own_window(
+            &poll(true),
+            Some(&inside),
+            Some(win)
+        ));
     }
 }
