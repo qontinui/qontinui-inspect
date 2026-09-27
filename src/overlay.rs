@@ -38,8 +38,7 @@
 //! own window at absolute screen coordinates). The inspector's in-UI
 //! highlighting keeps working in both cases.
 
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
 
 use serde::{Deserialize, Serialize};
 use tauri::{Emitter, Manager};
@@ -215,26 +214,58 @@ pub fn overlay_support() -> Result<(), String> {
 
 /// Last drawn state, so an overlay page that loads after an emit can pull it
 /// (`get_overlay_state`) instead of missing it.
+///
+/// ONE mutex serializes every `show` / `hide` end to end — sequence
+/// allocation, window geometry, the recorded state and the emit. With the
+/// sequence, the recorded state and the window moves locked separately, two
+/// concurrent shows could interleave so that the window ends up placed for
+/// one draw while the page renders the other (newer seq), or a `hide` could
+/// land between a show's state write and its `show()` and be undone. Nothing
+/// in `show` / `hide` awaits, so a `std` mutex is enough.
 #[derive(Default)]
 pub struct OverlayState {
-    last: Mutex<Option<OverlayDraw>>,
-    seq: AtomicU64,
+    inner: Mutex<OverlayInner>,
+}
+
+#[derive(Default)]
+struct OverlayInner {
+    /// Last sequence number handed out.
+    seq: u64,
+    last: Option<OverlayDraw>,
+}
+
+impl OverlayInner {
+    /// The next draw sequence number (1, 2, …).
+    fn next_seq(&mut self) -> u64 {
+        self.seq += 1;
+        self.seq
+    }
+
+    /// Allocate the next draw for `rects` and record it as the current one.
+    fn begin_draw(&mut self, kind: OverlayKind, rects: Vec<OverlayRect>) -> OverlayDraw {
+        let draw = OverlayDraw {
+            seq: self.next_seq(),
+            kind,
+            color: kind.color().to_string(),
+            border: BORDER_PX,
+            rects,
+        };
+        self.last = Some(draw.clone());
+        draw
+    }
 }
 
 impl OverlayState {
-    /// The next draw sequence number (1, 2, …).
-    pub fn next_seq(&self) -> u64 {
-        self.seq.fetch_add(1, Ordering::Relaxed) + 1
+    /// Hold the overlay lock. A poisoned lock is taken over: the state it
+    /// guards is plain data that is valid at every point a panic could leave.
+    fn lock(&self) -> MutexGuard<'_, OverlayInner> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     pub fn last(&self) -> Option<OverlayDraw> {
-        self.last.lock().ok().and_then(|g| g.clone())
-    }
-
-    fn set(&self, draw: Option<OverlayDraw>) {
-        if let Ok(mut g) = self.last.lock() {
-            *g = draw;
-        }
+        self.lock().last.clone()
     }
 }
 
@@ -268,6 +299,7 @@ fn ensure_window(app: &tauri::AppHandle) -> Result<tauri::WebviewWindow, String>
 }
 
 /// Position the overlay over `bounds` and draw them in `kind`'s colour.
+/// Serialized with every other `show` / `hide` (see [`OverlayState`]).
 pub fn show(
     app: &tauri::AppHandle,
     state: &OverlayState,
@@ -277,13 +309,8 @@ pub fn show(
     overlay_support()?;
     let geometry = overlay_geometry(bounds, BORDER_PX)
         .ok_or_else(|| "overlay: no element bounds to draw (all empty or missing)".to_string())?;
-    let draw = OverlayDraw {
-        seq: state.next_seq(),
-        kind,
-        color: kind.color().to_string(),
-        border: BORDER_PX,
-        rects: geometry.rects.clone(),
-    };
+
+    let mut inner = state.lock();
 
     #[cfg(not(target_os = "macos"))]
     {
@@ -294,7 +321,7 @@ pub fn show(
         window
             .set_size(tauri::PhysicalSize::new(geometry.width, geometry.height))
             .map_err(|e| format!("overlay resize failed: {}", e))?;
-        state.set(Some(draw.clone()));
+        let draw = inner.begin_draw(kind, geometry.rects);
         app.emit_to(OVERLAY_LABEL, OVERLAY_DRAW_EVENT, &draw)
             .map_err(|e| format!("overlay emit failed: {}", e))?;
         window
@@ -303,13 +330,21 @@ pub fn show(
         // Re-assert click-through after show: some window managers reset the
         // input shape when a window is mapped.
         let _ = window.set_ignore_cursor_events(true);
+        Ok(draw)
     }
-    Ok(draw)
+
+    #[cfg(target_os = "macos")]
+    {
+        // Unreachable: `overlay_support` refuses macOS above.
+        Ok(inner.begin_draw(kind, geometry.rects))
+    }
 }
 
 /// Hide the overlay (kept alive for reuse). A no-op when it was never shown.
+/// Serialized with every other `show` / `hide` (see [`OverlayState`]).
 pub fn hide(app: &tauri::AppHandle, state: &OverlayState) -> Result<(), String> {
-    state.set(None);
+    let mut inner = state.lock();
+    inner.last = None;
     if let Some(window) = app.get_webview_window(OVERLAY_LABEL) {
         window
             .hide()
@@ -373,9 +408,31 @@ mod tests {
     #[test]
     fn draw_sequence_is_monotonic_from_one() {
         let state = OverlayState::default();
-        assert_eq!(state.next_seq(), 1);
-        assert_eq!(state.next_seq(), 2);
-        assert_eq!(state.next_seq(), 3);
+        let mut inner = state.lock();
+        assert_eq!(inner.next_seq(), 1);
+        assert_eq!(inner.next_seq(), 2);
+        assert_eq!(inner.next_seq(), 3);
+    }
+
+    #[test]
+    fn concurrent_draws_leave_the_newest_one_recorded() {
+        // Sequence allocation and the recorded draw share one lock, so the
+        // recorded draw is always the highest sequence handed out.
+        let state = std::sync::Arc::new(OverlayState::default());
+        let workers: Vec<_> = (0..8)
+            .map(|_| {
+                let state = state.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..200 {
+                        state.lock().begin_draw(OverlayKind::Hover, vec![]);
+                    }
+                })
+            })
+            .collect();
+        for w in workers {
+            w.join().unwrap();
+        }
+        assert_eq!(state.last().unwrap().seq, 8 * 200);
     }
 
     #[test]
