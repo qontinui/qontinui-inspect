@@ -222,6 +222,14 @@ pub fn overlay_support() -> Result<(), String> {
 /// one draw while the page renders the other (newer seq), or a `hide` could
 /// land between a show's state write and its `show()` and be undone. Nothing
 /// in `show` / `hide` awaits, so a `std` mutex is enough.
+///
+/// Callers must NEVER be on the main (event-loop) thread — and synchronous
+/// Tauri commands run there. `show` / `hide` hold this `std` mutex while
+/// building and moving the overlay window, and window operations are
+/// dispatched to the main thread and waited on: a caller on the main thread
+/// would wait on itself, and a second caller blocked on the mutex there would
+/// stall the thread the holder is waiting for. Call from an `async` command or
+/// a spawned task.
 #[derive(Default)]
 pub struct OverlayState {
     inner: Mutex<OverlayInner>,

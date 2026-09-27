@@ -50,9 +50,13 @@
 //! # The inspector's own window
 //!
 //! Clicking a button in the inspector moves keyboard focus into it. A
-//! resolved node lying entirely inside the inspector's main window
-//! (`tree::bounds_within` against the window's outer position and size) is
-//! not reported, so using the inspector does not replace the grid it shows.
+//! resolved node is not reported when BOTH hold ([`drop_as_own_window`]):
+//! the inspector's main window is the focused window, and the node lies
+//! entirely inside it (`tree::bounds_within` against the window's outer
+//! position and size). Geometry alone is not enough — a window of another
+//! application stacked above the inspector's area would have its focus
+//! changes swallowed — so the focus check comes first, and the geometry only
+//! narrows it.
 //!
 //! # Deduplication
 //!
@@ -75,7 +79,7 @@ use tracing::{debug, info, warn};
 
 use qontinui_runner_lib::accessibility::{
     events::A11yEvent,
-    model::{NodeSource, UnifiedNode, UnifiedRole, UnifiedState},
+    model::{NodeSource, UnifiedBounds, UnifiedNode, UnifiedRole, UnifiedState},
     traits::ConnectionTarget,
 };
 
@@ -230,11 +234,33 @@ fn main_window_rect(app: &tauri::AppHandle) -> Option<WindowRect> {
     Some((pos.x, pos.y, size.width, size.height))
 }
 
+/// Whether the inspector's main window is the focused window. `false` when it
+/// is missing or the platform cannot say.
+fn main_window_focused(app: &tauri::AppHandle) -> bool {
+    app.get_webview_window("main")
+        .map(|window| window.is_focused().unwrap_or(false))
+        .unwrap_or(false)
+}
+
 /// Whether a resolved report is about an element of the inspector's own main
 /// window (see the module docs).
 fn is_inspector_own(app: &tauri::AppHandle, resolved: &Resolved) -> bool {
-    match (&resolved.grid.bounds, main_window_rect(app)) {
-        (Some(bounds), Some(window)) => bounds_within(bounds, window),
+    let focused = main_window_focused(app);
+    // Only look the geometry up when it can matter.
+    let window = if focused { main_window_rect(app) } else { None };
+    drop_as_own_window(focused, resolved.grid.bounds.as_ref(), window)
+}
+
+/// Whether a focus report is dropped as the inspector's own: only while the
+/// inspector's main window is focused, AND the element lies entirely within
+/// that window's rectangle. Pure, so the rule is tested without a window.
+pub fn drop_as_own_window(
+    inspector_focused: bool,
+    bounds: Option<&UnifiedBounds>,
+    window: Option<WindowRect>,
+) -> bool {
+    match (inspector_focused, bounds, window) {
+        (true, Some(bounds), Some(window)) => bounds_within(bounds, window),
         _ => false,
     }
 }
@@ -496,7 +522,7 @@ fn unresolved_grid(event_ref: &str, node_name: Option<&str>, why: &str) -> Prope
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tree::test_support::node;
+    use crate::tree::test_support::{bounds, node};
 
     fn tree() -> UnifiedNode {
         let mut root = node("@e1", UnifiedRole::Window);
@@ -615,5 +641,18 @@ mod tests {
             recapture_wait(Some(t0), t0 + Duration::from_secs(5), min),
             None
         );
+    }
+
+    #[test]
+    fn own_window_drop_needs_the_inspector_focused_and_the_node_inside() {
+        let win: WindowRect = (100, 100, 800, 600);
+        let inside = bounds(150, 150, 100, 30);
+        let outside = bounds(10, 10, 50, 50);
+        assert!(drop_as_own_window(true, Some(&inside), Some(win)));
+        // Another app's window over the inspector's area: not focused, kept.
+        assert!(!drop_as_own_window(false, Some(&inside), Some(win)));
+        assert!(!drop_as_own_window(true, Some(&outside), Some(win)));
+        assert!(!drop_as_own_window(true, None, Some(win)));
+        assert!(!drop_as_own_window(true, Some(&inside), None));
     }
 }
