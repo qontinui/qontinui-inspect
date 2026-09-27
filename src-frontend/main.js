@@ -6,8 +6,9 @@
 //   - capture_desktop
 //   - start_hover_mode / stop_hover_mode
 //   - start_focus_tracking / stop_focus_tracking
-//   - get_selector_for_ref / show_selector_matches
-//   - get_property_grid
+//   - show_selector_matches
+//   - get_property_grid (its grid carries the selector; get_selector_for_ref
+//     returns the same value and is kept for other callers)
 //   - show_overlay / hide_overlay
 //   - save_collapse_state / load_collapse_state
 //
@@ -280,13 +281,37 @@ function refFromInput() {
   return refInput.value.trim();
 }
 
-// Capture generation of the ref in the input box, when it was filled from a
-// shown element (null when typed by hand). Sent with every ref command so the
-// backend refuses a ref the tree has since renumbered ("stale ref — re-select").
+// Capture generation and element identity of the ref in the input box, when
+// it was filled from a shown element (both null when typed by hand). Sent with
+// every ref command: the focus task and hover loop re-capture on their own,
+// and the backend re-finds a ref from an older generation by its identity —
+// refusing it ("stale ref — re-select") only when that fails.
 let refInputGeneration = null;
+let refInputIdentity = null;
 refInput.addEventListener("input", () => {
   refInputGeneration = null;
+  refInputIdentity = null;
 });
+
+// The backend answered with the element's CURRENT ref and generation (they
+// change when it was re-found after a re-capture): adopt them everywhere the
+// old ones are held, so the next command does not have to re-find it again.
+function adoptCurrentRef(oldRef, oldGeneration, ref, generation, selector) {
+  if (
+    shownGrid &&
+    refLabel(shownGrid.ref_id) === refLabel(oldRef) &&
+    shownGrid.generation === oldGeneration
+  ) {
+    shownGrid.ref_id = ref;
+    shownGrid.generation = generation;
+    shownGrid.selector = selector;
+    renderPropertyGrid(shownGrid);
+  }
+  if (refInputGeneration === oldGeneration && refLabel(refFromInput()) === refLabel(oldRef)) {
+    refInput.value = refLabel(ref);
+    refInputGeneration = generation;
+  }
+}
 
 getSelectorBtn.addEventListener("click", async () => {
   const refId = refFromInput();
@@ -297,15 +322,16 @@ getSelectorBtn.addEventListener("click", async () => {
   }
   try {
     const generation = refInputGeneration;
-    const info = await invoke("get_selector_for_ref", { refId, generation });
-    renderSelector(selectorOutput, info);
+    const identity = refInputIdentity;
+    // The grid carries the selector (the same value get_selector_for_ref
+    // returns) plus the element's current ref and generation.
+    const grid = await invoke("get_property_grid", { refId, generation, identity });
+    renderSelector(selectorOutput, grid.selector);
     // Entering a ref selects that element (blue).
-    try {
-      const grid = await invoke("get_property_grid", { refId, generation });
-      showGrid(grid, "selected");
-    } catch (_) {
-      // ignore — grid may not be loaded
-    }
+    showGrid(grid, "selected");
+    refInput.value = refLabel(grid.ref_id);
+    refInputGeneration = grid.generation;
+    refInputIdentity = grid.identity;
   } catch (e) {
     selectorOutput.textContent = `error: ${e}`;
   }
@@ -319,8 +345,10 @@ showMatchesBtn.addEventListener("click", async () => {
     return;
   }
   const generation = typed ? refInputGeneration : shownGrid.generation;
+  const identity = typed ? refInputIdentity : shownGrid.identity;
   try {
-    const res = await invoke("show_selector_matches", { refId, generation });
+    const res = await invoke("show_selector_matches", { refId, generation, identity });
+    adoptCurrentRef(refId, generation, res.ref_id, res.generation, res.selector);
     renderSelector(selectorOutput, res.selector);
     const lines = [
       `${res.match_refs.length} match(es) on the captured desktop ` +
@@ -385,6 +413,7 @@ selectCurrentBtn.addEventListener("click", () => {
     showGrid(shownGrid, "selected");
     refInput.value = refLabel(shownGrid.ref_id);
     refInputGeneration = shownGrid.generation;
+    refInputIdentity = shownGrid.identity;
     statusEl.textContent = `selected ${refLabel(shownGrid.ref_id)}`;
   }
 });

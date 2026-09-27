@@ -6,6 +6,8 @@
 
 use std::collections::HashSet;
 
+use serde::{Deserialize, Serialize};
+
 use qontinui_runner_lib::accessibility::model::{UnifiedBounds, UnifiedNode, UnifiedRole};
 
 /// Title of the inspector's own in-target overlay window (see `overlay.rs`).
@@ -23,12 +25,17 @@ pub const OVERLAY_WINDOW_TITLE: &str = "Qontinui Inspector Overlay";
 /// capture, so the same element carries a different ref after the focus task
 /// or hover loop re-captures. `platform_handle` cannot either — it indexes the
 /// adapter's handle table, which hands out fresh handles per capture. What is
-/// stable for an element that has not moved is its role, automation id, class
-/// name and screen bounds, so that tuple is the identity used to decide
-/// whether a focus / hover report is about the element already shown.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// stable for an element that has not moved is its role, name, automation id,
+/// class name and screen bounds, so that tuple is the identity used to decide
+/// whether a focus / hover report is about the element already shown, and to
+/// re-find a shown element after a re-capture (see [`resolve_ref`]).
+///
+/// It is serialized into every `PropertyGrid` so the frontend can hand it back
+/// with a ref.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NodeIdentity {
     pub role: UnifiedRole,
+    pub name: Option<String>,
     pub automation_id: Option<String>,
     pub class_name: Option<String>,
     /// `(x, y, width, height)`.
@@ -39,6 +46,7 @@ impl NodeIdentity {
     pub fn of(node: &UnifiedNode) -> Self {
         Self {
             role: node.role,
+            name: node.name.clone(),
             automation_id: node.automation_id.clone(),
             class_name: node.class_name.clone(),
             bounds: node.bounds.as_ref().map(|b| (b.x, b.y, b.width, b.height)),
@@ -76,15 +84,109 @@ pub fn check_ref_generation(
     current: u64,
 ) -> Result<(), String> {
     match requested {
-        Some(g) if g != current => Err(format!(
-            "stale ref — re-select: {} is from capture generation {}, but the tree has since \
-             been re-captured (generation {}) and refs were renumbered",
-            normalize_ref(ref_id),
-            g,
-            current
-        )),
+        Some(g) if g != current => Err(stale_ref_message(ref_id, g, current)),
         _ => Ok(()),
     }
+}
+
+fn stale_ref_message(ref_id: &str, requested: u64, current: u64) -> String {
+    format!(
+        "stale ref — re-select: {} is from capture generation {}, but the tree has since \
+         been re-captured (generation {}) and refs were renumbered",
+        normalize_ref(ref_id),
+        requested,
+        current
+    )
+}
+
+/// Resolve a ref the frontend is showing against the current snapshot.
+///
+/// The focus task and the hover loop re-capture on their own, so the
+/// generation a shown grid came from goes stale without the user doing
+/// anything. A ref from the current generation (or a hand-typed ref, with no
+/// generation) is looked up as-is. A ref from another generation is
+/// re-resolved by `identity` — the shown element's [`NodeIdentity`] — and the
+/// node found is returned, carrying its CURRENT ref; the caller hands that
+/// ref and `current` back so the frontend can update what it shows. The ref
+/// is refused ("stale ref — re-select") only when there is no identity to go
+/// by, or the identity matches no node, or several.
+pub fn resolve_ref<'a>(
+    root: &'a UnifiedNode,
+    ref_id: &str,
+    requested: Option<u64>,
+    current: u64,
+    identity: Option<&NodeIdentity>,
+) -> Result<&'a UnifiedNode, String> {
+    match requested {
+        Some(g) if g != current => {
+            let Some(identity) = identity else {
+                return Err(stale_ref_message(ref_id, g, current));
+            };
+            match find_all_by_identity(root, identity).as_slice() {
+                [node] => Ok(node),
+                [] => Err(format!(
+                    "{} — the element is no longer in the tree",
+                    stale_ref_message(ref_id, g, current)
+                )),
+                many => Err(format!(
+                    "{} — {} elements now match its identity",
+                    stale_ref_message(ref_id, g, current),
+                    many.len()
+                )),
+            }
+        }
+        _ => root
+            .find_by_ref(&normalize_ref(ref_id))
+            .ok_or_else(|| format!("ref not found: {}", ref_id)),
+    }
+}
+
+/// Every node whose [`NodeIdentity`] equals `identity`, skipping the overlay.
+pub fn find_all_by_identity<'a>(
+    root: &'a UnifiedNode,
+    identity: &NodeIdentity,
+) -> Vec<&'a UnifiedNode> {
+    fn walk<'a>(node: &'a UnifiedNode, identity: &NodeIdentity, hits: &mut Vec<&'a UnifiedNode>) {
+        if is_overlay_window(node) {
+            return;
+        }
+        if NodeIdentity::of(node) == *identity {
+            hits.push(node);
+        }
+        for child in &node.children {
+            walk(child, identity, hits);
+        }
+    }
+    let mut hits = Vec::new();
+    walk(root, identity, &mut hits);
+    hits
+}
+
+/// A window's outer rectangle in screen physical pixels, `(x, y, width,
+/// height)` — the same space as `UnifiedBounds`.
+pub type WindowRect = (i32, i32, u32, u32);
+
+/// Whether `bounds` lies entirely inside `window`. Used to drop focus events
+/// for the inspector's own main window: clicking a button in the inspector
+/// moves keyboard focus into it, and reporting that would replace the grid
+/// the user is working with. Entirely inside, not merely overlapping, so an
+/// element of the target app that the inspector only partly covers still
+/// reports. Empty bounds are never inside.
+pub fn bounds_within(bounds: &UnifiedBounds, window: WindowRect) -> bool {
+    if bounds.width <= 0 || bounds.height <= 0 {
+        return false;
+    }
+    let (wx, wy, ww, wh) = (
+        i64::from(window.0),
+        i64::from(window.1),
+        i64::from(window.2),
+        i64::from(window.3),
+    );
+    let (bx, by) = (i64::from(bounds.x), i64::from(bounds.y));
+    bx >= wx
+        && by >= wy
+        && bx + i64::from(bounds.width) <= wx + ww
+        && by + i64::from(bounds.height) <= wy + wh
 }
 
 /// Whether `node` is the inspector's overlay window.
@@ -355,6 +457,99 @@ mod tests {
         let save = NodeIdentity::of(&t.children[1]);
         assert!(is_new_identity(Some(&save), None));
         assert!(is_new_identity(None, None));
+    }
+
+    /// `tree()` with the ref manager's `@`-prefixed refs, which is what
+    /// `resolve_ref` looks up.
+    fn sigil_tree() -> UnifiedNode {
+        fn prefix(node: &mut UnifiedNode) {
+            node.ref_id = normalize_ref(&node.ref_id);
+            node.children.iter_mut().for_each(prefix);
+        }
+        let mut t = tree();
+        prefix(&mut t);
+        t
+    }
+
+    #[test]
+    fn current_or_handtyped_refs_resolve_as_given() {
+        let t = sigil_tree();
+        assert_eq!(
+            resolve_ref(&t, "e2", Some(7), 7, None).unwrap().ref_id,
+            "@e2"
+        );
+        assert_eq!(resolve_ref(&t, "@e3", None, 7, None).unwrap().ref_id, "@e3");
+        assert!(resolve_ref(&t, "e99", Some(7), 7, None)
+            .unwrap_err()
+            .starts_with("ref not found"));
+    }
+
+    #[test]
+    fn stale_ref_is_re_resolved_by_identity() {
+        let shown = tree();
+        let save = NodeIdentity::of(&shown.children[1]);
+        // A silent re-capture renumbered every ref.
+        let mut recaptured = tree();
+        recaptured.children[1].ref_id = "e42".into();
+        recaptured.children[2].ref_id = "e43".into();
+
+        let hit = resolve_ref(&recaptured, "e2", Some(6), 7, Some(&save)).unwrap();
+        assert_eq!(hit.ref_id, "e42");
+    }
+
+    #[test]
+    fn stale_ref_without_identity_or_with_a_missing_one_is_refused() {
+        let t = tree();
+        let err = resolve_ref(&t, "e2", Some(6), 7, None).unwrap_err();
+        assert!(err.starts_with("stale ref — re-select"), "{err}");
+
+        let mut gone = NodeIdentity::of(&t.children[1]);
+        gone.bounds = Some((500, 500, 10, 10)); // moved / no longer there
+        let err = resolve_ref(&t, "e2", Some(6), 7, Some(&gone)).unwrap_err();
+        assert!(err.contains("no longer in the tree"), "{err}");
+    }
+
+    #[test]
+    fn stale_ref_with_an_ambiguous_identity_is_refused() {
+        let mut t = tree();
+        let save = NodeIdentity::of(&t.children[1]);
+        let mut twin = t.children[1].clone();
+        twin.ref_id = "e9".into();
+        t.children.push(twin);
+        let err = resolve_ref(&t, "e2", Some(6), 7, Some(&save)).unwrap_err();
+        assert!(err.contains("2 elements now match"), "{err}");
+    }
+
+    #[test]
+    fn identity_includes_the_name() {
+        let t = tree();
+        let mut renamed = t.children[1].clone();
+        renamed.name = Some("Save As".into());
+        assert_ne!(NodeIdentity::of(&t.children[1]), NodeIdentity::of(&renamed));
+    }
+
+    #[test]
+    fn identity_round_trips_through_json() {
+        let t = tree();
+        let id = NodeIdentity::of(&t.children[2]);
+        let back: NodeIdentity =
+            serde_json::from_value(serde_json::to_value(&id).unwrap()).unwrap();
+        assert_eq!(back, id);
+    }
+
+    #[test]
+    fn bounds_within_requires_full_containment() {
+        let win: WindowRect = (100, 100, 800, 600);
+        assert!(bounds_within(&bounds(150, 150, 100, 30), win));
+        assert!(bounds_within(&bounds(100, 100, 800, 600), win)); // edge to edge
+        assert!(!bounds_within(&bounds(850, 150, 100, 30), win)); // straddles right edge
+        assert!(!bounds_within(&bounds(10, 10, 50, 50), win)); // outside
+        assert!(!bounds_within(&bounds(150, 150, 0, 30), win)); // empty
+                                                                // Negative coordinates (a monitor left of the primary).
+        assert!(bounds_within(
+            &bounds(-1800, 50, 100, 30),
+            (-1920, 0, 1920, 1080)
+        ));
     }
 
     #[test]

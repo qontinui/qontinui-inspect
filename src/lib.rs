@@ -38,7 +38,7 @@
 //! matching the parallel-Phase-2 refactor constraint in the plan. Focus
 //! tracking takes its events from `AccessibilityManager::subscribe()`, which
 //! carries the native adapter's own event stream, and polls when
-//! `has_native_events()` is `false`.
+//! `has_native_events()` is `false` or no focus event has arrived yet.
 
 pub mod focus;
 pub mod overlay;
@@ -122,11 +122,17 @@ pub struct PropertyGrid {
     pub state: UnifiedState,
     pub is_interactive: bool,
     /// Capture generation of the snapshot the node was read from. Refs are
-    /// renumbered by every capture, so ref-based commands take this back and
-    /// refuse a ref from an older generation ("stale ref — re-select") rather
-    /// than silently resolving it to whatever node now carries that ref.
-    /// `0` for an unresolved focus grid, which has no ref.
+    /// renumbered by every capture, so ref-based commands take this back
+    /// (with `identity`) and never resolve a ref from an older generation to
+    /// whatever node now carries that ref: they re-find the element by
+    /// identity, or refuse ("stale ref — re-select"). `0` for an unresolved
+    /// focus grid, which has no ref.
     pub generation: u64,
+    /// The node's [`NodeIdentity`]. The frontend sends it back with the ref,
+    /// so a ref whose generation has since been re-captured can be re-found
+    /// (`tree::resolve_ref`) instead of refused. `None` for an unresolved
+    /// focus grid.
+    pub identity: Option<NodeIdentity>,
     /// Show Selector result — the same value `get_selector_for_ref` returns.
     /// `None` only for a focus event that could not be resolved to a node.
     pub selector: Option<SelectorInfo>,
@@ -152,6 +158,7 @@ impl PropertyGrid {
             state: node.state.clone(),
             is_interactive: node.is_interactive,
             generation,
+            identity: Some(NodeIdentity::of(node)),
             selector: Some(selector::selector_for(node, root)),
             note: None,
         }
@@ -279,13 +286,19 @@ async fn stop_focus_tracking(state: tauri::State<'_, InspectorState>) -> Result<
 /// the snapshot root and generation, to `f`.
 ///
 /// `generation` is the capture generation the caller got the ref from (a
-/// `PropertyGrid`'s `generation`). When given, a ref from any other generation
-/// is refused — see `tree::check_ref_generation`. A ref typed by hand has no
-/// generation and is resolved against the current snapshot.
+/// `PropertyGrid`'s `generation`) and `identity` that grid's `identity`. The
+/// focus task and hover loop re-capture silently, so a shown ref's generation
+/// goes stale on its own; a ref from another generation is re-found by
+/// identity, and refused only when that fails — see `tree::resolve_ref`. The
+/// node handed to `f` then carries its CURRENT ref, and `f` receives the
+/// current generation, which every command returns so the frontend can update
+/// what it shows. A ref typed by hand has no generation and is resolved
+/// against the current snapshot.
 async fn with_cached_node<T>(
     state: &InspectorState,
     ref_id: &str,
     generation: Option<u64>,
+    identity: Option<&NodeIdentity>,
     f: impl FnOnce(&UnifiedNode, &UnifiedNode, u64) -> T,
 ) -> Result<T, String> {
     let mgr = state.manager.lock().await;
@@ -293,11 +306,7 @@ async fn with_cached_node<T>(
         .snapshot()
         .await
         .ok_or_else(|| "no tree captured yet — call capture_desktop first".to_string())?;
-    tree::check_ref_generation(ref_id, generation, snap.generation)?;
-    let node = snap
-        .root
-        .find_by_ref(&tree::normalize_ref(ref_id))
-        .ok_or_else(|| format!("ref not found: {}", ref_id))?;
+    let node = tree::resolve_ref(&snap.root, ref_id, generation, snap.generation, identity)?;
     Ok(f(node, &snap.root, snap.generation))
 }
 
@@ -306,26 +315,41 @@ async fn with_cached_node<T>(
 /// `{ "step": {"a11y_action": "query", "a11y_query_automation_id": "btn_ok"},
 ///    "strategy": "automation_id", "match_count": 1, "unique": true,
 ///    "session_ref": "@e3", "session_ref_note": "..." }`. See `selector.rs`.
+/// `session_ref` is the element's current ref (see `with_cached_node`).
 #[tauri::command]
 async fn get_selector_for_ref(
     ref_id: String,
     generation: Option<u64>,
+    identity: Option<NodeIdentity>,
     state: tauri::State<'_, InspectorState>,
 ) -> Result<SelectorInfo, String> {
-    with_cached_node(&state, &ref_id, generation, |node, root, _| {
-        selector::selector_for(node, root)
-    })
+    with_cached_node(
+        &state,
+        &ref_id,
+        generation,
+        identity.as_ref(),
+        |node, root, _| selector::selector_for(node, root),
+    )
     .await
 }
 
-/// Return a property-grid snapshot for the node identified by `ref_id`.
+/// Return a property-grid snapshot for the node identified by `ref_id`. Its
+/// `ref_id` and `generation` are the node's current ones.
 #[tauri::command]
 async fn get_property_grid(
     ref_id: String,
     generation: Option<u64>,
+    identity: Option<NodeIdentity>,
     state: tauri::State<'_, InspectorState>,
 ) -> Result<PropertyGrid, String> {
-    with_cached_node(&state, &ref_id, generation, PropertyGrid::from_node).await
+    with_cached_node(
+        &state,
+        &ref_id,
+        generation,
+        identity.as_ref(),
+        PropertyGrid::from_node,
+    )
+    .await
 }
 
 // -----------------------------------------------------------------------------
@@ -366,6 +390,10 @@ async fn get_overlay_state(
 /// Result of `show_selector_matches`.
 #[derive(Debug, Clone, serde::Serialize)]
 struct SelectorMatches {
+    /// The inspected element's current ref and generation (they differ from
+    /// the request's when it was re-found after a re-capture).
+    ref_id: String,
+    generation: u64,
     selector: SelectorInfo,
     /// Refs of every match (session refs, for display only).
     match_refs: Vec<String>,
@@ -382,23 +410,32 @@ struct SelectorMatches {
 async fn show_selector_matches(
     ref_id: String,
     generation: Option<u64>,
+    identity: Option<NodeIdentity>,
     app: tauri::AppHandle,
     state: tauri::State<'_, InspectorState>,
 ) -> Result<SelectorMatches, String> {
-    let (info, refs, rects) = with_cached_node(&state, &ref_id, generation, |node, root, _| {
-        let info = selector::selector_for(node, root);
-        let hits = selector::find_matches(&info.step, root).unwrap_or_default();
-        let refs = hits
-            .iter()
-            .map(|n| tree::normalize_ref(&n.ref_id))
-            .collect();
-        let rects = tree::bounds_of(&hits);
-        (info, refs, rects)
-    })
+    let (current_ref, current_generation, info, refs, rects) = with_cached_node(
+        &state,
+        &ref_id,
+        generation,
+        identity.as_ref(),
+        |node, root, current_generation| {
+            let info = selector::selector_for(node, root);
+            let hits = selector::find_matches(&info.step, root).unwrap_or_default();
+            let refs = hits
+                .iter()
+                .map(|n| tree::normalize_ref(&n.ref_id))
+                .collect();
+            let rects = tree::bounds_of(&hits);
+            (node.ref_id.clone(), current_generation, info, refs, rects)
+        },
+    )
     .await?;
     let drawn = rects.iter().filter(|b| b.width > 0 && b.height > 0).count();
     let overlay_error = overlay::show(&app, &state.overlay, &rects, OverlayKind::Match).err();
     Ok(SelectorMatches {
+        ref_id: current_ref,
+        generation: current_generation,
         selector: info,
         match_refs: refs,
         drawn: if overlay_error.is_some() { 0 } else { drawn },
@@ -555,4 +592,49 @@ pub fn run() {
         })
         .run(tauri::generate_context!())
         .expect("error while running qontinui-inspect tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+
+    /// The body between `open` and the next `close` in `src`.
+    fn section<'a>(src: &'a str, open: &str, close: &str) -> &'a str {
+        let start = src
+            .find(open)
+            .unwrap_or_else(|| panic!("`{open}` not found"))
+            + open.len();
+        let len = src[start..]
+            .find(close)
+            .unwrap_or_else(|| panic!("`{close}` not found after `{open}`"));
+        &src[start..start + len]
+    }
+
+    /// `build.rs`'s `APP_COMMANDS` must list exactly the commands `run()`
+    /// registers: a registered command missing from the manifest is refused
+    /// for every window at runtime, and a listed one that is not registered
+    /// grants a permission for nothing.
+    #[test]
+    fn app_manifest_lists_exactly_the_registered_commands() {
+        let manifest: BTreeSet<&str> = section(
+            include_str!("../build.rs"),
+            "const APP_COMMANDS: &[&str] = &[",
+            "];",
+        )
+        .split(',')
+        .map(|item| item.trim().trim_matches('"'))
+        .filter(|item| !item.is_empty())
+        .collect();
+
+        // Split the file so this test's own needle is not what is found.
+        let needle = concat!("generate_handler", "![");
+        let registered: BTreeSet<&str> = section(include_str!("lib.rs"), needle, "]")
+            .split(',')
+            .map(str::trim)
+            .filter(|item| !item.is_empty())
+            .collect();
+
+        assert!(!registered.is_empty(), "no commands parsed from lib.rs");
+        assert_eq!(manifest, registered);
+    }
 }

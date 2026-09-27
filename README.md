@@ -42,9 +42,12 @@ cargo tauri dev            # full app (needs frontend build toolchain)
   any application selects the focused element in the property grid and
   outlines it in green. Events come from the runner's `AccessibilityManager`
   event bus, which forwards the platform adapter's focus stream (UIA
-  focus-changed handler on Windows, AT-SPI `Event.Focus` on Linux); where the
-  connected adapter has no event stream (macOS AX and Java/JAB today) it polls
-  the tree once a second.
+  focus-changed handler on Windows; AT-SPI `Event.Focus` and
+  `Object:StateChanged:focused` on Linux). It polls the tree once a second
+  where the connected adapter has no event stream (macOS AX and Java/JAB
+  today), and also where a stream is attached but has not yet delivered a
+  focus event since (re)connecting. Focus moving into the inspector's own
+  window is ignored.
   An event that cannot be resolved to a captured node is still shown, marked
   unresolved.
 - **Show Selector** — for any element, the `native_accessibility` workflow step
