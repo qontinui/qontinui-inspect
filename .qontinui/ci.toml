@@ -1,0 +1,24 @@
+# Sibling build-dependency declaration, read by coord's POST /agents/allocate
+# (`crates/coord/src/ci_siblings.rs` in qontinui-coord), which materialises
+# each declared sibling beside an allocated worktree. Without it an allocated
+# qontinui-inspect worktree cannot build: Cargo.toml path-depends on
+# ../qontinui-runner/src-tauri, which path-depends on qontinui-schemas
+# (coord finding 85e667ec). Allocation expands siblings one level deep and not
+# transitively, so both are declared here.
+#
+# There are deliberately NO [[steps]]. This repo's CI runs on GitHub Actions
+# (coord.canonical_repos.ci_lane), so the runner's CI-dispatch lane never
+# reads this file. If this repo is ever moved to the runner lane, the runner's
+# parser refuses a manifest with no [[steps]] ("nothing to run"), which is
+# the signal to add them, not a silent no-op.
+version = 1
+
+# default-branch for both: the Actions lane (.github/workflows/qontinui-ci.yml)
+# clones each sibling's main at depth 1, and this repo records no pin.
+[[siblings]]
+repo = "qontinui/qontinui-runner"
+pin = "default-branch"
+
+[[siblings]]
+repo = "qontinui/qontinui-schemas"
+pin = "default-branch"
