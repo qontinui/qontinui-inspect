@@ -15,17 +15,22 @@ Linux Wayland sessions (see [Platform](#platform)).
 
 ## Layout requirement
 
-This crate has a path dependency on `qontinui-runner`'s accessibility library.
-Clone both repos as siblings:
+This crate has a path dependency on `qontinui-runner`'s accessibility library,
+and the runner in turn path-depends on `qontinui-schemas`. Clone all three repos
+as siblings:
 
 ```
 <parent>/
 ├── qontinui-runner/
+├── qontinui-schemas/
 └── qontinui-inspect/   ← this repo
 ```
 
-`Cargo.toml` references `../qontinui-runner/src-tauri` — a different layout
-will not resolve.
+`Cargo.toml` references `../qontinui-runner/src-tauri`, whose own manifest
+references `../../qontinui-schemas/*` — a different layout will not resolve.
+The same two siblings are declared in `.qontinui/ci.toml`, so a worktree
+allocated through coord's `POST /agents/allocate` gets them checked out beside
+it automatically.
 
 ## Build
 
